@@ -192,7 +192,6 @@ class IsaacLabDDSBackend(EvalBackend):
         self.sim.reset()
 
         self._resolve_joint_order()
-        self._zero_actuator_gains()
         self.mass = float(self.robot.root_physx_view.get_masses()[0].sum().item())
         self.mass_scale = 1.0
         if self.match_mass:
@@ -201,6 +200,10 @@ class IsaacLabDDSBackend(EvalBackend):
         foot_ids, foot_names = self.robot.find_bodies(FOOT_JOINT_PATTERN)
         self.foot_ids, self.foot_names = foot_ids, foot_names
         self.contact_sensor = self._make_contact_sensor()
+        # MUST come after every sim.reset(): a reset re-applies the actuator
+        # gains from the ArticulationCfg, which would put a PhysX PD loop back
+        # on top of the deploy binary's own PD and drive the robot away.
+        self._zero_actuator_gains()
 
         self.info = {
             "backend": "isaaclab",
@@ -330,13 +333,25 @@ class IsaacLabDDSBackend(EvalBackend):
               f"{current * scale:.3f} kg (x{scale:.4f})")
         return scale
 
-    def _zero_actuator_gains(self) -> None:
-        """PhysX must not run its own PD: the deploy binary's kp/kd are the only ones."""
+    def _zero_actuator_gains(self, verbose: bool = True) -> None:
+        """PhysX must not run its own PD: the deploy binary's kp/kd are the only ones.
+
+        Any ``sim.reset()`` re-applies the ArticulationCfg gains, so this has to
+        run after the last reset -- and again after each episode reset.
+        """
         import torch
 
         zeros = torch.zeros_like(self.robot.data.joint_stiffness)
         self.robot.write_joint_stiffness_to_sim(zeros)
         self.robot.write_joint_damping_to_sim(zeros)
+        residual = float(
+            self.robot.data.joint_stiffness.abs().max() + self.robot.data.joint_damping.abs().max()
+        )
+        if verbose:
+            print(f"[isaaclab-dds] PhysX actuator gains zeroed (residual {residual:.3g})")
+        if residual > 1e-6:
+            print("[isaaclab-dds] WARNING: PhysX still has non-zero joint gains; the robot is "
+                  "being driven by two PD loops and the results are invalid.")
 
     def _setup_bridge(self) -> None:
         import zmq
@@ -536,6 +551,9 @@ class IsaacLabDDSBackend(EvalBackend):
         self._push = np.zeros(3)
         self.t = 0.0
         self._next_step_wall = None
+
+        # Defensive: if anything re-applied the cfg gains, drop them again.
+        self._zero_actuator_gains(verbose=False)
 
         # 3) settle: let the teleport transient decay before recording starts
         end = time.monotonic() + self.settle_after_reset
