@@ -163,8 +163,11 @@ def aggregate(rows: list[dict]) -> list[dict]:
             "n": len(group),
             "success_rate": float(np.mean([1.0 if g["success"] else 0.0 for g in group])),
             "fall_rate": float(np.mean([1.0 if g["fell"] else 0.0 for g in group])),
+            # episodes that collapsed before the command was applied: they
+            # measure the reset, not the planner, and must not be read as falls
+            "invalid_rate": float(np.mean([1.0 if g.get("invalid") else 0.0 for g in group])),
         }
-        skip = set(agg) | {"seed", "episode_index", "fell", "success"}
+        skip = set(agg) | {"seed", "episode_index", "fell", "success", "invalid"}
         for key in group[0]:
             if key in skip:
                 continue

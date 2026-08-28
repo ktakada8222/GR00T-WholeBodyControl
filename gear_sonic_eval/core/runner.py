@@ -106,9 +106,11 @@ def run_episode(
             fall_counter += 1
             if fall_counter >= config.fall.hold_steps:
                 record.fell = True
+                record.fall_phase = "command" if active else "settle"
                 record.fall_time = (i * sim.control_dt) if active else 0.0
                 if verbose:
-                    print(f"    fall detected at t={record.fall_time:.2f}s")
+                    where = "while walking" if active else "during settle (before the command)"
+                    print(f"    fall detected at t={record.fall_time:.2f}s {where}")
                 break
         else:
             fall_counter = 0
@@ -153,15 +155,28 @@ def run_evaluation(
             tag = "" if not push else f" push={push['force']:g}N/{push['direction']}"
             print(f"[{n}/{len(episodes)}] {cond.name} (vx={cond.vx:+.2f} vy={cond.vy:+.2f} "
                   f"wz={cond.yaw_rate:+.2f}){tag} seed={ep['seed']}")
-        record = run_episode(
-            backend,
-            config,
-            cond,
-            seed=ep["seed"],
-            episode_index=ep["episode_index"],
-            disturbance=ep["disturbance"],
-            verbose=verbose,
-        )
+        # An episode that collapses during the settle phase never applied the
+        # command, so it measures the reset, not the planner. Retry it instead
+        # of letting it pollute the fall statistics.
+        retries = 0
+        while True:
+            record = run_episode(
+                backend,
+                config,
+                cond,
+                seed=ep["seed"] + 1000 * retries,
+                episode_index=ep["episode_index"],
+                disturbance=ep["disturbance"],
+                verbose=verbose,
+            )
+            record.reset_retries = retries
+            if record.fall_phase != "settle" or retries >= config.max_reset_retries:
+                break
+            retries += 1
+            if verbose:
+                print(f"    settle-phase collapse -> retrying ({retries}/{config.max_reset_retries})")
+        if record.fall_phase == "settle" and verbose:
+            print("    WARNING: episode still collapsed during settle; recorded as invalid")
         row = compute_metrics(
             record,
             transient=config.sim.transient_duration,

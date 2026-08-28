@@ -62,6 +62,11 @@ class EpisodeRecord:
     samples: list[StepSample] = field(default_factory=list)
     fell: bool = False
     fall_time: float = float("nan")
+    #: "none" | "settle" (before the command was applied -- the episode never
+    #: tested anything and is invalid) | "command".
+    fall_phase: str = "none"
+    #: Number of reset retries that preceded this (valid) episode.
+    reset_retries: int = 0
     duration: float = 0.0
     notes: str = ""
     #: "const" or "sine"; sine episodes additionally yield a tracking lag.
@@ -272,8 +277,11 @@ def compute_metrics(rec: EpisodeRecord, *, transient: float, dt: float, mass: fl
         "push_direction": rec.disturbance["direction"] if rec.disturbance else "none",
         "push_impulse": rec.disturbance["impulse"] if rec.disturbance else 0.0,
         "duration": rec.duration,
-        "fell": bool(rec.fell),
+        "fell": bool(rec.fell and rec.fall_phase == "command"),
         "success": bool(not rec.fell),
+        "invalid": bool(rec.fall_phase == "settle"),
+        "fall_phase": rec.fall_phase,
+        "reset_retries": rec.reset_retries,
         "time_to_fall": rec.fall_time,
         "num_samples": len(rec.samples),
     }

@@ -11,6 +11,7 @@
 name: sonic_eval_md_benchmark
 seed: 0
 num_episodes: 3          # >=3 so the 95% CI across seeds is meaningful
+max_reset_retries: 2     # retry episodes that collapse before the command starts
 
 sim:
   control_dt: 0.02
@@ -80,3 +81,4 @@ backend:
     deploy_timeout: 120.0
     real_time: true
     check_order: false   # true (or --check-order) prints the joint mapping
+    reset_joints: true   # false = keep the controller's pose, reset only the base

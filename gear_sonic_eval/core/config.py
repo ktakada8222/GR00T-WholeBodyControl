@@ -141,6 +141,9 @@ class EvalConfig:
     name: str = "sonic_walking_eval"
     seed: int = 0
     num_episodes: int = 1  # repeats per condition (each gets seed + index)
+    #: Retries for an episode that collapses during the settle phase (i.e. the
+    #: reset failed, not the planner). 0 disables retrying.
+    max_reset_retries: int = 2
     sim: SimConfig = field(default_factory=SimConfig)
     init: RobotInitConfig = field(default_factory=RobotInitConfig)
     fall: FallConfig = field(default_factory=FallConfig)

@@ -72,12 +72,22 @@ class IsaacLabDDSBackend(EvalBackend):
         self.settle_after_reset = float(cfg.get("settle_after_reset", 1.0))
         self.deploy_timeout = float(cfg.get("deploy_timeout", 120.0))
         self.pace_real_time = bool(cfg.get("real_time", True))
+        # GUI mode renders at most render_fps, not once per physics step: at
+        # 200 Hz physics a render per step cannot keep real time, and this
+        # backend must stay in lockstep with the wall-clock deploy process.
+        self.render_fps = float(cfg.get("render_fps", 30.0))
         self.robot_cfg_path = cfg.get(
             "robot_cfg", "gear_sonic.envs.manager_env.robots.g1:G1_CYLINDER_MODEL_12_DEX_CFG"
         )
         self.check_order = bool(cfg.get("check_order", False))
+        # Teleporting the joints back to the articulation default fights the
+        # controller, which is still holding its own target pose: the resulting
+        # PD spike can collapse the robot during the settle phase. false keeps
+        # the current joint pose and resets only the base.
+        self.reset_joints = bool(cfg.get("reset_joints", True))
         config.sim.real_time = False  # paced here, per physics step
 
+        _preflight()
         self._launch_app()
         self._build_scene()
         self._setup_bridge()
@@ -85,6 +95,10 @@ class IsaacLabDDSBackend(EvalBackend):
         self.t = 0.0
         self._push = np.zeros(3)
         self._next_step_wall = None
+        self._step_count = 0
+        self._render_every = max(
+            int(round(1.0 / (self.render_fps * self.config.sim.physics_dt))), 1
+        ) if self.render_fps > 0 else 0
 
     # ------------------------------------------------------------------ setup
     def _launch_app(self) -> None:
@@ -141,7 +155,8 @@ class IsaacLabDDSBackend(EvalBackend):
             "mass_kg": self.mass,
             "zmq_endpoint": f"tcp://{self.zmq_host}:{self.zmq_port}",
             "requires": "g1_deploy_onnx_ref --input-type zmq_manager on the same DDS domain",
-            "status": "UNTESTED - verify the joint mapping before trusting results",
+            "headless": self.headless,
+            "render_fps": self.render_fps if not self.headless else 0.0,
         }
 
     def _resolve_joint_order(self) -> None:
@@ -173,8 +188,9 @@ class IsaacLabDDSBackend(EvalBackend):
 
     def _setup_bridge(self) -> None:
         import zmq
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+
         from gear_sonic.utils.mujoco_sim.configs import BaseConfig
-        from gear_sonic.utils.mujoco_sim.simulator_factory import init_channel
         from gear_sonic.utils.mujoco_sim.unitree_sdk2py_bridge import UnitreeSdk2Bridge
 
         cfg = dict(self.config.backend.get("isaaclab", {}))
@@ -185,7 +201,14 @@ class IsaacLabDDSBackend(EvalBackend):
             control_frequency=int(round(1.0 / self.config.sim.control_dt)),
         )
         self.wbc_config = sim_cfg.load_wbc_yaml()
-        init_channel(config=self.wbc_config)
+        # ChannelFactoryInitialize directly rather than via
+        # gear_sonic.utils.mujoco_sim.simulator_factory.init_channel: that module
+        # imports base_sim, which imports mujoco -- an dependency this backend
+        # has no reason to require in an IsaacSim environment.
+        if self.wbc_config.get("INTERFACE", None):
+            ChannelFactoryInitialize(self.wbc_config["DOMAIN_ID"], self.wbc_config["INTERFACE"])
+        else:
+            ChannelFactoryInitialize(self.wbc_config["DOMAIN_ID"])
         self.bridge = UnitreeSdk2Bridge(self.wbc_config)
         self.num_motors = self.bridge.num_body_motor
         self.torque_limit = np.asarray(self.wbc_config["motor_effort_limit_list"], dtype=float)
@@ -273,7 +296,13 @@ class IsaacLabDDSBackend(EvalBackend):
             forces[0, 0] = torch.tensor(self._push, dtype=forces.dtype, device=forces.device)
             self.robot.set_external_force_and_torque(forces, torch.zeros_like(forces), body_ids=[0])
         self.robot.write_data_to_sim()
-        self.sim.step(render=not self.headless)
+        self._step_count += 1
+        render = (
+            not self.headless
+            and self._render_every
+            and self._step_count % self._render_every == 0
+        )
+        self.sim.step(render=bool(render))
         self.robot.update(self.sim_dt)
 
         if self.pace_real_time:
@@ -326,10 +355,13 @@ class IsaacLabDDSBackend(EvalBackend):
         root[:, 10:13] = torch.tensor(init.base_ang_vel, device=root.device, dtype=root.dtype)
         self.robot.write_root_state_to_sim(root)
 
-        joint_pos = self.robot.data.default_joint_pos.clone()
-        if init.joint_noise > 0.0:
-            noise = rng.normal(0.0, init.joint_noise, joint_pos.shape[-1])
-            joint_pos += torch.tensor(noise, device=joint_pos.device, dtype=joint_pos.dtype)
+        if self.reset_joints:
+            joint_pos = self.robot.data.default_joint_pos.clone()
+            if init.joint_noise > 0.0:
+                noise = rng.normal(0.0, init.joint_noise, joint_pos.shape[-1])
+                joint_pos += torch.tensor(noise, device=joint_pos.device, dtype=joint_pos.dtype)
+        else:
+            joint_pos = self.robot.data.joint_pos.clone()
         self.robot.write_joint_state_to_sim(joint_pos, torch.zeros_like(joint_pos))
 
         self._push = np.zeros(3)
@@ -385,6 +417,33 @@ class IsaacLabDDSBackend(EvalBackend):
             self.socket = None
         if getattr(self, "_app", None) is not None:
             self._app.close()
+
+
+def _preflight() -> None:
+    """Fail early, with a readable list, if the interpreter lacks a dependency.
+
+    This backend needs the IsaacSim stack *and* the gear_sonic DDS stack in the
+    same interpreter, which is the usual stumbling block: the IsaacLab
+    environment normally has neither unitree_sdk2py nor gear_sonic on its path.
+    """
+    import importlib.util
+
+    required = {
+        "isaaclab": "IsaacLab (run with IsaacLab's python, e.g. ./isaaclab.sh -p)",
+        "torch": "PyTorch (part of the IsaacSim environment)",
+        "zmq": "pyzmq",
+        "yaml": "PyYAML",
+        "scipy": "scipy",
+        "unitree_sdk2py": "unitree_sdk2py (pip install -e external_dependencies/unitree_sdk2_python)",
+        "gear_sonic": "gear_sonic (pip install -e . in GR00T-WholeBodyControl, or set PYTHONPATH)",
+    }
+    missing = [f"  {mod:16s} {hint}" for mod, hint in required.items()
+               if importlib.util.find_spec(mod) is None]
+    if missing:
+        raise SystemExit(
+            "the IsaacLab dds backend needs IsaacSim and the gear_sonic DDS stack in the "
+            "same interpreter; missing here:\n" + "\n".join(missing)
+        )
 
 
 def _idle_state() -> MovementState:
