@@ -173,6 +173,7 @@ def run_evaluation(
             if record.fall_phase != "settle" or retries >= config.max_reset_retries:
                 break
             retries += 1
+            backend.retry_hint(retries)
             if verbose:
                 print(f"    settle-phase collapse -> retrying ({retries}/{config.max_reset_retries})")
         if record.fall_phase == "settle" and verbose:

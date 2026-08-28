@@ -83,11 +83,20 @@ class IsaacLabDDSBackend(EvalBackend):
             "robot_cfg", "gear_sonic.envs.manager_env.robots.g1:G1_CYLINDER_MODEL_12_DEX_CFG"
         )
         self.check_order = bool(cfg.get("check_order", False))
-        # Teleporting the joints back to the articulation default fights the
-        # controller, which is still holding its own target pose: the resulting
-        # PD spike can collapse the robot during the settle phase. false keeps
-        # the current joint pose and resets only the base.
-        self.reset_joints = bool(cfg.get("reset_joints", True))
+        # How the joints are restored at an episode reset:
+        #   "command" (default) - to the pose the controller is currently
+        #       commanding (LowCmd q targets). The PD error at t=0 is then zero,
+        #       so the robot does not get kicked the moment the episode starts.
+        #   "default" - to the articulation's default pose. Deterministic, but it
+        #       fights the controller, which is still holding its own target.
+        #   "keep" - leave the joints as they are; only the base is teleported.
+        self.reset_joints = str(cfg.get("reset_joints", "command"))
+        if self.reset_joints in ("True", "true"):
+            self.reset_joints = "default"
+        elif self.reset_joints in ("False", "false"):
+            self.reset_joints = "keep"
+        if self.reset_joints not in ("command", "default", "keep"):
+            raise ValueError(f"unknown reset_joints: {self.reset_joints}")
         # Which simulator this run is supposed to be comparable with. See
         # PHYSICS_PARITY in this module and configs/g1_physics_reference.json.
         self.physics_parity = cfg.get("physics_parity", "training")
@@ -115,6 +124,7 @@ class IsaacLabDDSBackend(EvalBackend):
         self._push = np.zeros(3)
         self._next_step_wall = None
         self._step_count = 0
+        self._retry_noise = 0.0
         self._render_every = max(
             int(round(1.0 / (self.render_fps * self.config.sim.physics_dt))), 1
         ) if self.render_fps > 0 else 0
@@ -196,6 +206,7 @@ class IsaacLabDDSBackend(EvalBackend):
             "mass_kg": self.mass,
             "zmq_endpoint": f"tcp://{self.zmq_host}:{self.zmq_port}",
             "requires": "g1_deploy_onnx_ref --input-type zmq_manager on the same DDS domain",
+            "reset_joints": self.reset_joints,
             "physics_parity": self.physics_parity,
             "parity_overrides": self.parity_overrides,
             "static_friction": parity["static_friction"],
@@ -250,6 +261,32 @@ class IsaacLabDDSBackend(EvalBackend):
             print(f"[isaaclab-dds] contact sensor unavailable ({exc}); "
                   "falling back to a foot-height contact heuristic")
             return None
+
+    def _commanded_joint_pos(self):
+        """The joint pose the controller is currently commanding, in Isaac order.
+
+        Resetting to this instead of the articulation default removes the PD
+        spike at t=0: the deploy binary keeps running across episodes and holds
+        its own target pose, so teleporting elsewhere makes it slam the robot
+        back.  Falls back to the default pose before the first LowCmd arrives.
+        """
+        import torch
+
+        cmd = self.bridge.low_cmd if hasattr(self, "bridge") else None
+        if cmd is None or not self.bridge.cmd_received():
+            return self.robot.data.default_joint_pos.clone()
+        joint_pos = self.robot.data.default_joint_pos.clone()
+        with self.bridge.low_cmd_lock:
+            targets = [cmd.motor_cmd[i].q for i in range(self.num_motors)]
+        joint_pos[0, self.motor_to_isaac] = torch.tensor(
+            targets, device=joint_pos.device, dtype=joint_pos.dtype
+        )
+        return joint_pos
+
+    def retry_hint(self, attempt: int) -> None:
+        """Called by the runner before a retry: perturb the state so the retry
+        is not a bit-identical repeat of a deterministic failure."""
+        self._retry_noise = 0.01 * attempt
 
     def _match_mujoco_mass(self) -> float:
         """Scale every body mass so the robot's total matches the MuJoCo model.
@@ -466,13 +503,18 @@ class IsaacLabDDSBackend(EvalBackend):
         root[:, 10:13] = torch.tensor(init.base_ang_vel, device=root.device, dtype=root.dtype)
         self.robot.write_root_state_to_sim(root)
 
-        if self.reset_joints:
+        if self.reset_joints == "command":
+            joint_pos = self._commanded_joint_pos()
+        elif self.reset_joints == "default":
             joint_pos = self.robot.data.default_joint_pos.clone()
-            if init.joint_noise > 0.0:
-                noise = rng.normal(0.0, init.joint_noise, joint_pos.shape[-1])
-                joint_pos += torch.tensor(noise, device=joint_pos.device, dtype=joint_pos.dtype)
         else:
             joint_pos = self.robot.data.joint_pos.clone()
+        noise = init.joint_noise + self._retry_noise
+        if noise > 0.0:
+            joint_pos = joint_pos + torch.tensor(
+                rng.normal(0.0, noise, joint_pos.shape[-1]),
+                device=joint_pos.device, dtype=joint_pos.dtype,
+            )
         self.robot.write_joint_state_to_sim(joint_pos, torch.zeros_like(joint_pos))
 
         self._push = np.zeros(3)

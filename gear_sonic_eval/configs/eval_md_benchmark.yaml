@@ -81,7 +81,7 @@ backend:
     deploy_timeout: 120.0
     real_time: true
     check_order: false   # true (or --check-order) prints the joint mapping
-    reset_joints: true   # false = keep the controller's pose, reset only the base
+    reset_joints: command   # command | default | keep (see backend docs)
     # What this run is meant to be comparable with:
     #   training = the policy's own training physics (friction 1.0 multiply,
     #              capsule feet) -- the IsaacLab-native reading

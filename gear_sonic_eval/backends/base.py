@@ -61,6 +61,13 @@ class EvalBackend(abc.ABC):
         wait is not printed in the middle of the first episode's log line.
         """
 
+    def retry_hint(self, attempt: int) -> None:
+        """Called before re-running an episode that collapsed during settle.
+
+        Backends should perturb something so the retry is not a bit-identical
+        repeat of a deterministic failure.
+        """
+
     def begin_episode(self, condition, disturbance=None) -> None:
         """Optional hook called after ``reset`` with the episode descriptor.
 
