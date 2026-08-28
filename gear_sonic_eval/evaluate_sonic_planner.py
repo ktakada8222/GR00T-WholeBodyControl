@@ -46,6 +46,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--visualize", action="store_true", help="Open the simulator viewer.")
     p.add_argument("--real-time", action="store_true", help="Throttle MuJoCo to wall-clock time.")
     p.add_argument("--no-plots", action="store_true", help="Skip plot generation.")
+    p.add_argument("--backend-opt", action="append", default=[], metavar="KEY=VALUE",
+                   help="Override one backend setting for this run, e.g. "
+                        "--backend-opt physics_parity=default --backend-opt static_friction=1.0. "
+                        "Repeatable. Applies to the selected --sim backend's config block.")
     p.add_argument("--check-order", action="store_true",
                    help="IsaacLab dds mode: print the DDS-motor -> Isaac-joint mapping at startup.")
     p.add_argument("--no-isaaclab-report", action="store_true",
@@ -69,12 +73,35 @@ def apply_overrides(config: EvalConfig, args) -> EvalConfig:
         config.disturbance.enabled = False
     if args.real_time:
         config.sim.real_time = True
+    if args.backend_opt:
+        block = config.backend.setdefault(args.sim, {})
+        for item in args.backend_opt:
+            if "=" not in item:
+                raise SystemExit(f"--backend-opt expects KEY=VALUE, got {item!r}")
+            key, _, raw = item.partition("=")
+            block[key.strip()] = _coerce(raw.strip())
+            print(f"  backend override: {key.strip()} = {block[key.strip()]!r}")
     if args.conditions:
         wanted = set(args.conditions)
         config.conditions = [c for c in config.conditions if c.name in wanted or c.group in wanted]
         if not config.conditions:
             raise SystemExit(f"no conditions match {sorted(wanted)}")
     return config
+
+
+def _coerce(raw: str):
+    """YAML-ish scalar parsing for --backend-opt values."""
+    low = raw.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    if low in ("none", "null"):
+        return None
+    for cast in (int, float):
+        try:
+            return cast(raw)
+        except ValueError:
+            pass
+    return raw
 
 
 def make_backend(args, config: EvalConfig):
