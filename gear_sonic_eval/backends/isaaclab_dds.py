@@ -83,9 +83,17 @@ class IsaacLabDDSBackend(EvalBackend):
         # The Isaac URDF declares no joint <dynamics>, and this backend zeroes
         # the actuator PD (the deploy binary owns it), which leaves the joints
         # completely undamped -- the legs then ring and the feet chatter.
-        # "mujoco" applies the MuJoCo model's passive damping / armature /
-        # friction, which is the plant the deploy gains were tuned against.
-        self.passive_joint_dynamics = str(cfg.get("passive_joint_dynamics", "mujoco"))
+        #   "damping" (default) - MuJoCo's passive damping and joint friction,
+        #       keeping the articulation's own armature. The cfg armature is the
+        #       motor rotor inertia; replacing it with MuJoCo's much smaller
+        #       0.01 destabilises PhysX at the deploy's kp (up to 400).
+        #   "mujoco" - also force armature to MuJoCo's 0.01.
+        #   "none"   - leave the joints undamped (what the URDF gives).
+        self.passive_joint_dynamics = str(cfg.get("passive_joint_dynamics", "damping"))
+        if self.passive_joint_dynamics not in ("damping", "mujoco", "none"):
+            raise ValueError(
+                f"unknown passive_joint_dynamics: {self.passive_joint_dynamics}"
+            )
         # GUI mode renders at most render_fps, not once per physics step: at
         # 200 Hz physics a render per step cannot keep real time, and this
         # backend must stay in lockstep with the wall-clock deploy process.
@@ -266,14 +274,13 @@ class IsaacLabDDSBackend(EvalBackend):
         (0.1 on the wrists) to every joint, and the deploy kp/kd were tuned on
         that plant.
         """
-        if self.passive_joint_dynamics != "mujoco":
+        if self.passive_joint_dynamics == "none":
             return
         import torch
 
         jd = _load_physics_reference()["mujoco"]["joint_dynamics"]
         names = self.robot.joint_names
         damping = torch.full_like(self.robot.data.joint_damping, float(jd["damping"]))
-        armature = torch.full_like(self.robot.data.joint_armature, float(jd["armature"]))
         friction = torch.full(
             self.robot.data.joint_damping.shape, float(jd["frictionloss"]),
             device=self.robot.data.joint_damping.device,
@@ -284,7 +291,11 @@ class IsaacLabDDSBackend(EvalBackend):
                 friction[:, i] = float(jd["frictionloss_wrist"])
         # stiffness stays 0: only the deploy binary commands positions
         self.robot.write_joint_damping_to_sim(damping)
-        self.robot.write_joint_armature_to_sim(armature)
+        armature_note = "cfg (motor rotor inertia)"
+        if self.passive_joint_dynamics == "mujoco":
+            armature = torch.full_like(self.robot.data.joint_armature, float(jd["armature"]))
+            self.robot.write_joint_armature_to_sim(armature)
+            armature_note = str(jd["armature"])
         try:
             self.robot.write_joint_friction_coefficient_to_sim(friction)
             friction_note = f", friction={jd['frictionloss']}"
@@ -295,8 +306,8 @@ class IsaacLabDDSBackend(EvalBackend):
             except Exception as exc:  # noqa: BLE001
                 friction_note = f", friction NOT applied ({exc})"
         if verbose:
-            print(f"[isaaclab-dds] MuJoCo passive joint dynamics applied: "
-                  f"damping={jd['damping']}, armature={jd['armature']}{friction_note}")
+            print(f"[isaaclab-dds] passive joint dynamics ({self.passive_joint_dynamics}): "
+                  f"damping={jd['damping']}, armature={armature_note}{friction_note}")
 
     def _bind_foot_material(self, sim_utils, parity) -> None:
         """Give the feet an explicit physics material.
