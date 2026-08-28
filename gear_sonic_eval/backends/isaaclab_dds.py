@@ -75,6 +75,11 @@ class IsaacLabDDSBackend(EvalBackend):
         self.settle_after_reset = float(cfg.get("settle_after_reset", 1.0))
         self.deploy_timeout = float(cfg.get("deploy_timeout", 120.0))
         self.pace_real_time = bool(cfg.get("real_time", True))
+        # Seconds of IDLE *before* the teleport. The controller runs across
+        # episodes, so at the end of a walking episode it is mid-stride; moving
+        # the base to a fixed height while the legs are in a stride pose drops
+        # the robot. Commanding IDLE first lets it come back to a stance pose.
+        self.pre_reset_idle = float(cfg.get("pre_reset_idle", 1.5))
         # GUI mode renders at most render_fps, not once per physics step: at
         # 200 Hz physics a render per step cannot keep real time, and this
         # backend must stay in lockstep with the wall-clock deploy process.
@@ -207,6 +212,7 @@ class IsaacLabDDSBackend(EvalBackend):
             "zmq_endpoint": f"tcp://{self.zmq_host}:{self.zmq_port}",
             "requires": "g1_deploy_onnx_ref --input-type zmq_manager on the same DDS domain",
             "reset_joints": self.reset_joints,
+            "pre_reset_idle": self.pre_reset_idle,
             "physics_parity": self.physics_parity,
             "parity_overrides": self.parity_overrides,
             "static_friction": parity["static_friction"],
@@ -337,7 +343,8 @@ class IsaacLabDDSBackend(EvalBackend):
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
         from gear_sonic.utils.mujoco_sim.configs import BaseConfig
-        from gear_sonic.utils.mujoco_sim.unitree_sdk2py_bridge import UnitreeSdk2Bridge
+
+        from gear_sonic_eval.backends.dds_bridge import create_bridge
 
         cfg = dict(self.config.backend.get("isaaclab", {}))
         sim_cfg = BaseConfig(
@@ -355,7 +362,7 @@ class IsaacLabDDSBackend(EvalBackend):
             ChannelFactoryInitialize(self.wbc_config["DOMAIN_ID"], self.wbc_config["INTERFACE"])
         else:
             ChannelFactoryInitialize(self.wbc_config["DOMAIN_ID"])
-        self.bridge = UnitreeSdk2Bridge(self.wbc_config)
+        self.bridge = create_bridge(self.wbc_config)
         self.num_motors = self.bridge.num_body_motor
         self.torque_limit = np.asarray(self.wbc_config["motor_effort_limit_list"], dtype=float)
 
@@ -495,6 +502,15 @@ class IsaacLabDDSBackend(EvalBackend):
 
         rng = np.random.default_rng(seed)
         init = self.config.init
+
+        # 1) quiesce: hold IDLE so the controller returns to a standing pose
+        self.send_movement_state(_idle_state())
+        self._next_step_wall = None
+        end = time.monotonic() + self.pre_reset_idle
+        while time.monotonic() < end:
+            self._physics_step()
+
+        # 2) teleport
         root = self.robot.data.default_root_state.clone()
         root[:, 0:2] = torch.tensor(init.base_xy, device=root.device, dtype=root.dtype)
         root[:, 2] = init.base_height
@@ -520,7 +536,8 @@ class IsaacLabDDSBackend(EvalBackend):
         self._push = np.zeros(3)
         self.t = 0.0
         self._next_step_wall = None
-        self.send_movement_state(_idle_state())
+
+        # 3) settle: let the teleport transient decay before recording starts
         end = time.monotonic() + self.settle_after_reset
         while time.monotonic() < end:
             self._physics_step()

@@ -121,14 +121,9 @@ class MujocoBackend(EvalBackend):
         # and injects it (init_unitree_bridge + set_unitree_bridge in base_sim.py).
         # We own the loop instead of BaseSimulator, so we must do the same here,
         # after ChannelFactoryInitialize and before the first sim_step.
-        from gear_sonic.utils.mujoco_sim.unitree_sdk2py_bridge import UnitreeSdk2Bridge
+        from gear_sonic_eval.backends.dds_bridge import create_bridge
 
-        self.bridge = UnitreeSdk2Bridge(self.wbc_config)
-        if self.wbc_config.get("USE_JOYSTICK"):
-            self.bridge.SetupJoystick(
-                device_id=self.wbc_config["JOYSTICK_DEVICE"],
-                js_type=self.wbc_config["JOYSTICK_TYPE"],
-            )
+        self.bridge = create_bridge(self.wbc_config)
         self.env.set_unitree_bridge(self.bridge)
         self.model, self.data = self.env.mj_model, self.env.mj_data
         self.pelvis_id = self.model.body("pelvis").id
