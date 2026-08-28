@@ -95,6 +95,15 @@ class IsaacLabDDSBackend(EvalBackend):
             raise ValueError(f"unknown physics_parity: {self.physics_parity}")
         self.match_mass = bool(cfg.get("match_mujoco_mass",
                                        self.physics_parity == "mujoco"))
+        # Per-knob overrides on top of the preset, so the three differences
+        # (friction, foot geometry, mass) can be changed one at a time -- which
+        # is the only way to attribute a behaviour change to one of them.
+        self.parity_overrides = {
+            k: cfg[k] for k in (
+                "static_friction", "dynamic_friction", "friction_combine_mode",
+                "restitution_combine_mode", "replace_cylinders_with_capsules",
+            ) if k in cfg
+        }
         config.sim.real_time = False  # paced here, per physics step
 
         _preflight()
@@ -128,7 +137,12 @@ class IsaacLabDDSBackend(EvalBackend):
         self.sim_dt = physics_dt
         self.substeps = max(int(round(self.config.sim.control_dt / physics_dt)), 1)
 
-        parity = PHYSICS_PARITY[self.physics_parity]
+        parity = dict(PHYSICS_PARITY[self.physics_parity])
+        parity.update(self.parity_overrides)
+        print(f"[isaaclab-dds] physics: parity={self.physics_parity} "
+              f"friction={parity['static_friction']}/{parity['friction_combine_mode']} "
+              f"capsules={parity['replace_cylinders_with_capsules']} "
+              f"match_mass={self.match_mass}")
         ground_cfg = sim_utils.GroundPlaneCfg(
             physics_material=sim_utils.RigidBodyMaterialCfg(
                 static_friction=parity["static_friction"],
@@ -183,6 +197,7 @@ class IsaacLabDDSBackend(EvalBackend):
             "zmq_endpoint": f"tcp://{self.zmq_host}:{self.zmq_port}",
             "requires": "g1_deploy_onnx_ref --input-type zmq_manager on the same DDS domain",
             "physics_parity": self.physics_parity,
+            "parity_overrides": self.parity_overrides,
             "static_friction": parity["static_friction"],
             "friction_combine_mode": parity["friction_combine_mode"],
             "replace_cylinders_with_capsules": parity["replace_cylinders_with_capsules"],
