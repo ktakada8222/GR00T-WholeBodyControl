@@ -127,6 +127,53 @@ The container runs with `--network host`, so the deploy binary's ZMQ subscriber
 (`--zmq-host localhost`, port 5556 by default) reaches the PUB socket the
 benchmark binds on the host.
 
+### IsaacLab: the same Sonic stack, a different physics engine
+
+`backend.isaaclab.mode` selects what runs:
+
+| mode | what actually executes | comparable to MuJoCo? |
+|---|---|---|
+| `dds` (default) | **the real deploy binary**: planner + WBC policy over DDS, IsaacLab/PhysX as the physics engine. Same ZMQ commands, same PD law, same episode protocol as the MuJoCo backend | yes — this is the sim-to-sim comparison |
+| `trajectory` | replays a planner trajectory CSV as PD targets; no WBC policy | partly — planner output only |
+| `velocity_policy` | an RL locomotion policy under the same command grid; no Sonic planner | no — it is the baseline to compare *against* |
+
+`dds` mode works because `UnitreeSdk2Bridge` never touches MuJoCo: it publishes
+`rt/lowstate` from a plain dict and exposes the received `rt/lowcmd`.  The
+backend fills that dict from `robot.data`, applies
+`tau = tau_ff + kp (q_des - q) + kd (dq_des - dq)` exactly as
+`DefaultEnv.compute_body_torques` does, and zeroes the PhysX actuator gains so
+there is no second PD loop.
+
+DDS motor index `i` is defined by the MuJoCo model's joint order, stored in
+`configs/g1_motor_order.json` (regenerate with `tools/dump_motor_order.py`) and
+resolved to Isaac joint indices **by name**.  Check it before trusting a run:
+
+```bash
+python gear_sonic_eval/evaluate_sonic_planner.py --sim isaaclab \
+    --config gear_sonic_eval/configs/eval_md_benchmark.yaml \
+    --conditions forward_vx+0.40 --check-order --headless
+```
+
+Run it the same way as MuJoCo — one terminal for the benchmark, one for the
+deploy binary — but **never both simulators at once**: they would both publish
+`rt/lowstate` on the same DDS domain.
+
+```bash
+# Terminal 1 (host): IsaacLab + benchmark
+python gear_sonic_eval/evaluate_sonic_planner.py --sim isaaclab \
+    --config gear_sonic_eval/configs/eval_md_benchmark.yaml --headless
+
+# Terminal 2 (docker): unchanged
+bash deploy.sh --input-type zmq_manager sim
+```
+
+Then compare the two engines in one report:
+
+```bash
+python <IsaacLab>/scripts/reinforcement_learning/rsl_rl/report_locomotion.py \
+    --inputs mujoco=results/mujoco isaaclab=results/isaaclab --out results
+```
+
 ## report.md — identical format to the IsaacLab G1 benchmark
 
 Every run also writes `results/<backend>/eval.npz` + `eval.json` in the schema of

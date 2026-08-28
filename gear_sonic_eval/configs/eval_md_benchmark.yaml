@@ -68,6 +68,15 @@ backend:
     real_time: true
     stop_on_close: false
   isaaclab:
-    mode: trajectory
-    task: Isaac-Velocity-Flat-G1-Play-v0
-    trajectory_dir: null
+    # dds = the real Sonic stack (planner + WBC policy) over DDS, IsaacLab as
+    # the physics engine. Same deploy binary as the MuJoCo run.
+    mode: dds
+    robot_cfg: "gear_sonic.envs.manager_env.robots.g1:G1_CYLINDER_MODEL_12_DEX_CFG"
+    zmq_port: 5556
+    interface: sim
+    startup_wait: 2.0
+    arm_wait: 8.0
+    settle_after_reset: 1.0
+    deploy_timeout: 120.0
+    real_time: true
+    check_order: false   # true (or --check-order) prints the joint mapping

@@ -1,0 +1,395 @@
+"""IsaacLab backend that runs the **real Sonic stack** (planner + WBC policy).
+
+This is the true sim-to-sim counterpart of the MuJoCo backend: the very same
+``g1_deploy_onnx_ref`` process controls the robot, only the physics engine
+changes.
+
+    evaluate_sonic_planner.py --sim isaaclab           (backend.isaaclab.mode: dds)
+        | ZMQ  command + planner topics
+        v
+    g1_deploy_onnx_ref  --input-type zmq_manager
+        | DDS  rt/lowstate  <---- published by THIS backend from Isaac state
+        | DDS  rt/lowcmd    ----> consumed by THIS backend, PD -> joint efforts
+        v
+    IsaacLab / PhysX G1 articulation
+
+What makes it possible: ``UnitreeSdk2Bridge`` (gear_sonic/utils/mujoco_sim/
+unitree_sdk2py_bridge.py) never touches MuJoCo -- it publishes from a plain obs
+dict and exposes the received ``low_cmd``.  So the same bridge is reused here,
+fed from ``robot.data`` instead of ``mj_data``, and the PD law from
+``DefaultEnv.compute_body_torques`` is replicated verbatim:
+
+    tau_i = tau_ff_i + kp_i * (q_des_i - q_i) + kd_i * (dq_des_i - dq_i)
+
+The actuators must therefore be configured with zero stiffness/damping so PhysX
+does not add a second PD loop on top (see ``_zero_actuator_gains``).
+
+**Joint order.** DDS motor index ``i`` is defined by the MuJoCo model's joint
+order (``configs/g1_motor_order.json``, regenerate with
+``tools/dump_motor_order.py``).  The Isaac articulation orders joints
+differently, so every exchange goes through a name-resolved permutation.  A
+wrong permutation is the most likely cause of a robot that instantly collapses;
+``--check-order`` prints the resolved mapping before the run.
+
+Untested: this module has never been executed -- no IsaacSim in the development
+environment.  Treat the first run as a bring-up, and use ``--check-order`` plus
+a single low-speed condition before trusting any numbers.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import time
+
+import numpy as np
+
+from gear_sonic_eval.backends.base import EvalBackend
+from gear_sonic_eval.core.commands import MovementState
+from gear_sonic_eval.core.metrics import StepSample
+
+MOTOR_ORDER_FILE = Path(__file__).resolve().parent.parent / "configs" / "g1_motor_order.json"
+FOOT_JOINT_PATTERN = ".*ankle_roll.*"
+
+
+def load_motor_order() -> dict:
+    return json.loads(MOTOR_ORDER_FILE.read_text())
+
+
+class IsaacLabDDSBackend(EvalBackend):
+    """Sonic planner + WBC policy over DDS, with IsaacLab as the physics engine."""
+
+    name = "isaaclab"
+
+    def __init__(self, config, *, headless: bool = True):
+        super().__init__(config)
+        cfg = dict(config.backend.get("isaaclab", {}))
+        self.headless = headless
+        self.zmq_host = cfg.get("zmq_host", "*")
+        self.zmq_port = int(cfg.get("zmq_port", 5556))
+        self.startup_wait = float(cfg.get("startup_wait", 2.0))
+        self.arm_wait = float(cfg.get("arm_wait", 8.0))
+        self.settle_after_reset = float(cfg.get("settle_after_reset", 1.0))
+        self.deploy_timeout = float(cfg.get("deploy_timeout", 120.0))
+        self.pace_real_time = bool(cfg.get("real_time", True))
+        self.robot_cfg_path = cfg.get(
+            "robot_cfg", "gear_sonic.envs.manager_env.robots.g1:G1_CYLINDER_MODEL_12_DEX_CFG"
+        )
+        self.check_order = bool(cfg.get("check_order", False))
+        config.sim.real_time = False  # paced here, per physics step
+
+        self._launch_app()
+        self._build_scene()
+        self._setup_bridge()
+        self._armed = False
+        self.t = 0.0
+        self._push = np.zeros(3)
+        self._next_step_wall = None
+
+    # ------------------------------------------------------------------ setup
+    def _launch_app(self) -> None:
+        from isaaclab.app import AppLauncher
+
+        self._app_launcher = AppLauncher({"headless": self.headless})
+        self._app = self._app_launcher.app
+
+    def _build_scene(self) -> None:
+        """Minimal scene: ground plane, light, one G1 -- no RL env, no commands."""
+        import isaaclab.sim as sim_utils
+        from isaaclab.assets import Articulation
+        from isaaclab.sim import SimulationCfg, SimulationContext
+
+        physics_dt = self.config.sim.physics_dt
+        self.sim = SimulationContext(SimulationCfg(dt=physics_dt, device="cuda:0"))
+        self.sim_dt = physics_dt
+        self.substeps = max(int(round(self.config.sim.control_dt / physics_dt)), 1)
+
+        sim_utils.GroundPlaneCfg().func("/World/ground", sim_utils.GroundPlaneCfg())
+        sim_utils.DomeLightCfg(intensity=2000.0).func(
+            "/World/Light", sim_utils.DomeLightCfg(intensity=2000.0)
+        )
+
+        module_name, _, attr = self.robot_cfg_path.partition(":")
+        import importlib
+
+        robot_cfg = getattr(importlib.import_module(module_name), attr).copy()
+        robot_cfg.prim_path = "/World/Robot"
+        robot_cfg.init_state.pos = (
+            self.config.init.base_xy[0],
+            self.config.init.base_xy[1],
+            self.config.init.base_height,
+        )
+        self.robot = Articulation(robot_cfg)
+        self.sim.reset()
+
+        self._resolve_joint_order()
+        self._zero_actuator_gains()
+        self.mass = float(self.robot.root_physx_view.get_masses()[0].sum().item())
+        foot_ids, foot_names = self.robot.find_bodies(FOOT_JOINT_PATTERN)
+        self.foot_ids, self.foot_names = foot_ids, foot_names
+        try:
+            self.contact_sensor = self.robot  # contact forces via the articulation view
+        except Exception:  # noqa: BLE001
+            self.contact_sensor = None
+
+        self.info = {
+            "backend": "isaaclab",
+            "mode": "dds",
+            "robot_cfg": self.robot_cfg_path,
+            "physics_dt": physics_dt,
+            "control_dt": self.config.sim.control_dt,
+            "mass_kg": self.mass,
+            "zmq_endpoint": f"tcp://{self.zmq_host}:{self.zmq_port}",
+            "requires": "g1_deploy_onnx_ref --input-type zmq_manager on the same DDS domain",
+            "status": "UNTESTED - verify the joint mapping before trusting results",
+        }
+
+    def _resolve_joint_order(self) -> None:
+        """Permutations between DDS motor index and Isaac joint index."""
+        order = load_motor_order()
+        names = order["body_joints"]
+        ids, resolved = self.robot.find_joints(names, preserve_order=True)
+        if len(ids) != len(names):
+            missing = set(names) - set(resolved)
+            raise RuntimeError(
+                f"robot articulation is missing DDS motor joints: {sorted(missing)}. "
+                f"Check backend.isaaclab.robot_cfg -- it must be the same 29-DoF G1 the "
+                f"deploy binary was built for."
+            )
+        self.motor_to_isaac = np.asarray(ids, dtype=int)  # motor i -> isaac joint index
+        self.motor_names = resolved
+        if self.check_order:
+            print("[isaaclab-dds] DDS motor -> Isaac joint mapping")
+            for i, (name, idx) in enumerate(zip(resolved, ids)):
+                print(f"  motor {i:2d} {name:32s} -> isaac joint {idx}")
+
+    def _zero_actuator_gains(self) -> None:
+        """PhysX must not run its own PD: the deploy binary's kp/kd are the only ones."""
+        import torch
+
+        zeros = torch.zeros_like(self.robot.data.joint_stiffness)
+        self.robot.write_joint_stiffness_to_sim(zeros)
+        self.robot.write_joint_damping_to_sim(zeros)
+
+    def _setup_bridge(self) -> None:
+        import zmq
+        from gear_sonic.utils.mujoco_sim.configs import BaseConfig
+        from gear_sonic.utils.mujoco_sim.simulator_factory import init_channel
+        from gear_sonic.utils.mujoco_sim.unitree_sdk2py_bridge import UnitreeSdk2Bridge
+
+        cfg = dict(self.config.backend.get("isaaclab", {}))
+        sim_cfg = BaseConfig(
+            wbc_version=cfg.get("wbc_version", "sonic_model12"),
+            interface=cfg.get("interface", "sim"),
+            sim_frequency=int(round(1.0 / self.config.sim.physics_dt)),
+            control_frequency=int(round(1.0 / self.config.sim.control_dt)),
+        )
+        self.wbc_config = sim_cfg.load_wbc_yaml()
+        init_channel(config=self.wbc_config)
+        self.bridge = UnitreeSdk2Bridge(self.wbc_config)
+        self.num_motors = self.bridge.num_body_motor
+        self.torque_limit = np.asarray(self.wbc_config["motor_effort_limit_list"], dtype=float)
+
+        ctx = zmq.Context.instance()
+        self.socket = ctx.socket(zmq.PUB)
+        self.socket.bind(f"tcp://{self.zmq_host}:{self.zmq_port}")
+        time.sleep(0.5)
+
+    # -------------------------------------------------------------------- ZMQ
+    def _send_command(self, start: bool, stop: bool, planner: bool = True) -> None:
+        from gear_sonic.utils.teleop.zmq.zmq_planner_sender import build_command_message
+
+        self.socket.send(build_command_message(start=start, stop=stop, planner=planner))
+
+    def send_movement_state(self, state: MovementState) -> None:
+        from gear_sonic.utils.teleop.zmq.zmq_planner_sender import build_planner_message
+
+        self.socket.send(
+            build_planner_message(
+                mode=state.locomotion_mode,
+                movement=state.movement_direction,
+                facing=state.facing_direction,
+                speed=state.movement_speed,
+                height=state.height,
+            )
+        )
+
+    # ---------------------------------------------------------------- physics
+    def _observe_dict(self) -> dict:
+        """The obs dict UnitreeSdk2Bridge.PublishLowState expects, in motor order."""
+        d = self.robot.data
+        q = d.joint_pos[0].cpu().numpy()[self.motor_to_isaac]
+        dq = d.joint_vel[0].cpu().numpy()[self.motor_to_isaac]
+        tau = d.applied_torque[0].cpu().numpy()[self.motor_to_isaac]
+        acc = d.joint_acc[0].cpu().numpy()[self.motor_to_isaac] if hasattr(d, "joint_acc") \
+            else np.zeros_like(q)
+        pos = d.root_pos_w[0].cpu().numpy()
+        quat = d.root_quat_w[0].cpu().numpy()  # (w, x, y, z), same convention as MuJoCo
+        lin = d.root_lin_vel_w[0].cpu().numpy()
+        ang = d.root_ang_vel_b[0].cpu().numpy()
+        hands = np.zeros(self.bridge.num_hand_motor)
+        return {
+            "body_q": q, "body_dq": dq, "body_ddq": acc, "body_tau_est": tau,
+            "floating_base_pose": np.concatenate([pos, quat]),
+            "floating_base_vel": np.concatenate([lin, ang]),
+            # PhysX exposes no base linear acceleration; the IMU accelerometer
+            # channel is left at zero (the Sonic policy does not observe it).
+            "floating_base_acc": np.zeros(6),
+            "secondary_imu_quat": quat,
+            "secondary_imu_vel": np.concatenate([lin, ang]),
+            "left_hand_q": hands, "left_hand_dq": hands,
+            "right_hand_q": hands, "right_hand_dq": hands,
+            "time": self.t,
+        }
+
+    def _torques_from_lowcmd(self) -> np.ndarray:
+        """Replica of DefaultEnv.compute_body_torques (same PD law, same order)."""
+        d = self.robot.data
+        q = d.joint_pos[0].cpu().numpy()[self.motor_to_isaac]
+        dq = d.joint_vel[0].cpu().numpy()[self.motor_to_isaac]
+        tau = np.zeros(self.num_motors)
+        cmd = self.bridge.low_cmd
+        if cmd is None:
+            return tau
+        with self.bridge.low_cmd_lock:
+            for i in range(self.num_motors):
+                m = cmd.motor_cmd[i]
+                tau[i] = m.tau + m.kp * (m.q - q[i]) + m.kd * (m.dq - dq[i])
+        return np.clip(tau, -self.torque_limit[: self.num_motors],
+                       self.torque_limit[: self.num_motors])
+
+    def _physics_step(self) -> None:
+        import torch
+
+        self.bridge.PublishLowState(self._observe_dict())
+        tau = self._torques_from_lowcmd()
+        efforts = torch.zeros((1, self.robot.num_joints), device=self.robot.device)
+        efforts[0, self.motor_to_isaac] = torch.tensor(
+            tau, dtype=efforts.dtype, device=efforts.device
+        )
+        self.robot.set_joint_effort_target(efforts)
+        if np.linalg.norm(self._push) > 0.0:
+            forces = torch.zeros((1, 1, 3), device=self.robot.device)
+            forces[0, 0] = torch.tensor(self._push, dtype=forces.dtype, device=forces.device)
+            self.robot.set_external_force_and_torque(forces, torch.zeros_like(forces), body_ids=[0])
+        self.robot.write_data_to_sim()
+        self.sim.step(render=not self.headless)
+        self.robot.update(self.sim_dt)
+
+        if self.pace_real_time:
+            now = time.monotonic()
+            if self._next_step_wall is None:
+                self._next_step_wall = now
+            self._next_step_wall += self.sim_dt
+            delay = self._next_step_wall - now
+            if delay > 0:
+                time.sleep(delay)
+            elif delay < -0.5:
+                self._next_step_wall = now
+
+    # --------------------------------------------------------------- protocol
+    def prepare(self) -> None:
+        if self._armed:
+            return
+        print("waiting for g1_deploy_onnx_ref (LowCmd on rt/lowcmd) ...")
+        deadline = time.monotonic() + self.deploy_timeout
+        seen = False
+        while time.monotonic() < deadline:
+            self._physics_step()
+            if self.bridge.cmd_received():
+                seen = True
+                break
+        if not seen:
+            print("  WARNING: no LowCmd received; is the deploy binary running with "
+                  "--input-type zmq_manager on the same DDS interface?")
+        else:
+            end = time.monotonic() + self.startup_wait
+            while time.monotonic() < end:
+                self._physics_step()
+        print("arming the controller (command{start=true, planner=true}) ...")
+        self._send_command(start=True, stop=False, planner=True)
+        end = time.monotonic() + self.arm_wait
+        while time.monotonic() < end:
+            self._physics_step()
+        self._armed = True
+
+    def reset(self, seed: int) -> None:
+        import torch
+
+        rng = np.random.default_rng(seed)
+        init = self.config.init
+        root = self.robot.data.default_root_state.clone()
+        root[:, 0:2] = torch.tensor(init.base_xy, device=root.device, dtype=root.dtype)
+        root[:, 2] = init.base_height
+        root[:, 3:7] = torch.tensor(_yaw_quat(init.base_yaw), device=root.device, dtype=root.dtype)
+        root[:, 7:10] = torch.tensor(init.base_lin_vel, device=root.device, dtype=root.dtype)
+        root[:, 10:13] = torch.tensor(init.base_ang_vel, device=root.device, dtype=root.dtype)
+        self.robot.write_root_state_to_sim(root)
+
+        joint_pos = self.robot.data.default_joint_pos.clone()
+        if init.joint_noise > 0.0:
+            noise = rng.normal(0.0, init.joint_noise, joint_pos.shape[-1])
+            joint_pos += torch.tensor(noise, device=joint_pos.device, dtype=joint_pos.dtype)
+        self.robot.write_joint_state_to_sim(joint_pos, torch.zeros_like(joint_pos))
+
+        self._push = np.zeros(3)
+        self.t = 0.0
+        self._next_step_wall = None
+        self.send_movement_state(_idle_state())
+        end = time.monotonic() + self.settle_after_reset
+        while time.monotonic() < end:
+            self._physics_step()
+
+    def step(self) -> StepSample:
+        for _ in range(self.substeps):
+            self._physics_step()
+        self.t += self.config.sim.control_dt
+        return self._sample()
+
+    def apply_push(self, force_world, duration: float) -> None:
+        self._push = np.asarray(force_world, dtype=float)
+
+    def base_yaw(self) -> float:
+        w, x, y, z = self.robot.data.root_quat_w[0].cpu().numpy()
+        return float(np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)))
+
+    def _sample(self) -> StepSample:
+        d = self.robot.data
+        contacts, foot_pos = None, None
+        if self.foot_ids:
+            foot_pos = d.body_pos_w[0, self.foot_ids, :].cpu().numpy()
+            # No ContactSensor in this minimal scene: infer stance from foot height.
+            contacts = (foot_pos[:, 2] < 0.06).astype(float).tolist()
+        return StepSample(
+            t=self.t,
+            cmd_vx=0.0, cmd_vy=0.0, cmd_yaw_rate=0.0,
+            base_pos=d.root_pos_w[0].cpu().numpy(),
+            base_quat=d.root_quat_w[0].cpu().numpy(),
+            lin_vel_body=d.root_lin_vel_b[0].cpu().numpy(),
+            ang_vel_body=d.root_ang_vel_b[0].cpu().numpy(),
+            joint_pos=d.joint_pos[0].cpu().numpy()[self.motor_to_isaac],
+            joint_vel=d.joint_vel[0].cpu().numpy()[self.motor_to_isaac],
+            joint_torque=d.applied_torque[0].cpu().numpy()[self.motor_to_isaac],
+            foot_contact=contacts,
+            foot_pos=foot_pos,
+        )
+
+    def close(self) -> None:
+        socket = getattr(self, "socket", None)
+        if socket is not None:
+            try:
+                self.send_movement_state(_idle_state())
+            except Exception as exc:  # noqa: BLE001
+                print(f"[isaaclab-dds] could not send final command: {exc}")
+            socket.close(linger=200)
+            self.socket = None
+        if getattr(self, "_app", None) is not None:
+            self._app.close()
+
+
+def _idle_state() -> MovementState:
+    return MovementState(0, (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 0.0, -1.0)
+
+
+def _yaw_quat(yaw: float):
+    return [float(np.cos(yaw / 2)), 0.0, 0.0, float(np.sin(yaw / 2))]

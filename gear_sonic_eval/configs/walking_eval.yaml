@@ -58,7 +58,12 @@ backend:
     elastic_band: false  # the "9" key band must stay off during evaluation
     real_time: true      # the deploy binary is a wall-clock 50 Hz process
   isaaclab:
-    mode: trajectory     # trajectory | velocity_policy
-    task: Isaac-Velocity-Flat-G1-Play-v0
-    trajectory_dir: null # dir of planner-motion CSVs, one per condition
-    checkpoint: null     # only for mode: velocity_policy
+    mode: dds            # dds | trajectory | velocity_policy
+    robot_cfg: "gear_sonic.envs.manager_env.robots.g1:G1_CYLINDER_MODEL_12_DEX_CFG"
+    zmq_port: 5556
+    interface: sim
+    arm_wait: 8.0
+    real_time: true
+    task: Isaac-Velocity-Flat-G1-Play-v0   # velocity_policy mode only
+    trajectory_dir: null # trajectory mode: dir of planner-motion CSVs
+    checkpoint: null     # velocity_policy mode only

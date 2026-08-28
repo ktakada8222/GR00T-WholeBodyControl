@@ -46,6 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--visualize", action="store_true", help="Open the simulator viewer.")
     p.add_argument("--real-time", action="store_true", help="Throttle MuJoCo to wall-clock time.")
     p.add_argument("--no-plots", action="store_true", help="Skip plot generation.")
+    p.add_argument("--check-order", action="store_true",
+                   help="IsaacLab dds mode: print the DDS-motor -> Isaac-joint mapping at startup.")
     p.add_argument("--no-isaaclab-report", action="store_true",
                    help="Skip the eval.npz/eval.json export used by report_locomotion.py.")
     p.add_argument("--no-timeseries", action="store_true", help="Do not dump per-step CSVs.")
@@ -84,9 +86,19 @@ def make_backend(args, config: EvalConfig):
         from gear_sonic_eval.backends.mujoco_backend import MujocoBackend
 
         return MujocoBackend(config, onscreen=args.visualize and not args.headless)
+    mode = config.backend.get("isaaclab", {}).get("mode", "dds")
+    headless = args.headless or not args.visualize
+    if mode == "dds":
+        # full Sonic stack (planner + WBC policy) driving the Isaac robot
+        from gear_sonic_eval.backends.isaaclab_dds import IsaacLabDDSBackend
+
+        if args.check_order:
+            config.backend.setdefault("isaaclab", {})["check_order"] = True
+        return IsaacLabDDSBackend(config, headless=headless)
+
     from gear_sonic_eval.backends.isaaclab_backend import IsaacLabBackend
 
-    return IsaacLabBackend(config, headless=args.headless or not args.visualize)
+    return IsaacLabBackend(config, headless=headless)
 
 
 def main(argv=None) -> int:

@@ -30,4 +30,4 @@ conditions:
 
 backend:
   mujoco: {zmq_port: 5556, interface: sim, arm_wait: 8.0, elastic_band: false}
-  isaaclab: {mode: trajectory, task: Isaac-Velocity-Flat-G1-Play-v0}
+  isaaclab: {mode: dds, zmq_port: 5556, interface: sim, arm_wait: 8.0, real_time: true}
