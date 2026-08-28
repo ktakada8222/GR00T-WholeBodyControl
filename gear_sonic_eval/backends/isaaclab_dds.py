@@ -80,6 +80,12 @@ class IsaacLabDDSBackend(EvalBackend):
         # the base to a fixed height while the legs are in a stride pose drops
         # the robot. Commanding IDLE first lets it come back to a stance pose.
         self.pre_reset_idle = float(cfg.get("pre_reset_idle", 1.5))
+        # The Isaac URDF declares no joint <dynamics>, and this backend zeroes
+        # the actuator PD (the deploy binary owns it), which leaves the joints
+        # completely undamped -- the legs then ring and the feet chatter.
+        # "mujoco" applies the MuJoCo model's passive damping / armature /
+        # friction, which is the plant the deploy gains were tuned against.
+        self.passive_joint_dynamics = str(cfg.get("passive_joint_dynamics", "mujoco"))
         # GUI mode renders at most render_fps, not once per physics step: at
         # 200 Hz physics a render per step cannot keep real time, and this
         # backend must stay in lockstep with the wall-clock deploy process.
@@ -116,6 +122,7 @@ class IsaacLabDDSBackend(EvalBackend):
             k: cfg[k] for k in (
                 "static_friction", "dynamic_friction", "friction_combine_mode",
                 "restitution_combine_mode", "replace_cylinders_with_capsules",
+                "bind_robot_material",
             ) if k in cfg
         }
         config.sim.real_time = False  # paced here, per physics step
@@ -157,6 +164,7 @@ class IsaacLabDDSBackend(EvalBackend):
         print(f"[isaaclab-dds] physics: parity={self.physics_parity} "
               f"friction={parity['static_friction']}/{parity['friction_combine_mode']} "
               f"capsules={parity['replace_cylinders_with_capsules']} "
+              f"bind_foot_mat={parity.get('bind_robot_material', True)} "
               f"match_mass={self.match_mass}")
         ground_cfg = sim_utils.GroundPlaneCfg(
             physics_material=sim_utils.RigidBodyMaterialCfg(
@@ -190,6 +198,7 @@ class IsaacLabDDSBackend(EvalBackend):
         )
         self.robot = Articulation(robot_cfg)
         self.sim.reset()
+        self._bind_foot_material(sim_utils, parity)
 
         self._resolve_joint_order()
         self.mass = float(self.robot.root_physx_view.get_masses()[0].sum().item())
@@ -215,6 +224,7 @@ class IsaacLabDDSBackend(EvalBackend):
             "zmq_endpoint": f"tcp://{self.zmq_host}:{self.zmq_port}",
             "requires": "g1_deploy_onnx_ref --input-type zmq_manager on the same DDS domain",
             "reset_joints": self.reset_joints,
+            "passive_joint_dynamics": self.passive_joint_dynamics,
             "pre_reset_idle": self.pre_reset_idle,
             "physics_parity": self.physics_parity,
             "parity_overrides": self.parity_overrides,
@@ -245,6 +255,84 @@ class IsaacLabDDSBackend(EvalBackend):
             print("[isaaclab-dds] DDS motor -> Isaac joint mapping")
             for i, (name, idx) in enumerate(zip(resolved, ids)):
                 print(f"  motor {i:2d} {name:32s} -> isaac joint {idx}")
+
+    def _apply_passive_joint_dynamics(self, verbose: bool = True) -> None:
+        """Give the joints MuJoCo's passive damping, armature and friction.
+
+        Zeroing the actuator gains removes PhysX's PD, which is correct (the
+        deploy binary is the only controller), but it also removes the only
+        damping the Isaac model had: the URDF carries no ``<dynamics>``.  MuJoCo
+        applies ``damping=0.05``, ``armature=0.01`` and ``frictionloss=0.2``
+        (0.1 on the wrists) to every joint, and the deploy kp/kd were tuned on
+        that plant.
+        """
+        if self.passive_joint_dynamics != "mujoco":
+            return
+        import torch
+
+        jd = _load_physics_reference()["mujoco"]["joint_dynamics"]
+        names = self.robot.joint_names
+        damping = torch.full_like(self.robot.data.joint_damping, float(jd["damping"]))
+        armature = torch.full_like(self.robot.data.joint_armature, float(jd["armature"]))
+        friction = torch.full(
+            self.robot.data.joint_damping.shape, float(jd["frictionloss"]),
+            device=self.robot.data.joint_damping.device,
+            dtype=self.robot.data.joint_damping.dtype,
+        )
+        for i, name in enumerate(names):
+            if "wrist" in name or "hand" in name:
+                friction[:, i] = float(jd["frictionloss_wrist"])
+        # stiffness stays 0: only the deploy binary commands positions
+        self.robot.write_joint_damping_to_sim(damping)
+        self.robot.write_joint_armature_to_sim(armature)
+        try:
+            self.robot.write_joint_friction_coefficient_to_sim(friction)
+            friction_note = f", friction={jd['frictionloss']}"
+        except Exception:  # noqa: BLE001 - older IsaacLab spells it differently
+            try:
+                self.robot.write_joint_friction_to_sim(friction)
+                friction_note = f", friction={jd['frictionloss']}"
+            except Exception as exc:  # noqa: BLE001
+                friction_note = f", friction NOT applied ({exc})"
+        if verbose:
+            print(f"[isaaclab-dds] MuJoCo passive joint dynamics applied: "
+                  f"damping={jd['damping']}, armature={jd['armature']}{friction_note}")
+
+    def _bind_foot_material(self, sim_utils, parity) -> None:
+        """Give the feet an explicit physics material.
+
+        Without this the robot's collision material is whatever the URDF
+        importer chose, which is invisible from the config and interacts with
+        the ground material through the combine mode: with ``multiply`` an
+        unknown robot value silently scales the ground's 1.0, and with
+        ``average`` it halves it.  Binding both sides makes the effective
+        coefficient the number written in the config.
+        """
+        if not parity.get("bind_robot_material", True):
+            return
+        try:
+            from isaaclab.sim.utils import bind_physics_material
+
+            mat_path = "/World/Robot/footPhysicsMaterial"
+            mat_cfg = sim_utils.RigidBodyMaterialCfg(
+                static_friction=parity["static_friction"],
+                dynamic_friction=parity["dynamic_friction"],
+                restitution=0.0,
+                friction_combine_mode=parity["friction_combine_mode"],
+                restitution_combine_mode=parity["restitution_combine_mode"],
+            )
+            mat_cfg.func(mat_path, mat_cfg)
+            bound = []
+            for side in ("left", "right"):
+                link = f"/World/Robot/{side}_ankle_roll_link"
+                bind_physics_material(link, mat_path)
+                bound.append(link)
+            print(f"[isaaclab-dds] foot material bound (mu={parity['static_friction']}) "
+                  f"on {len(bound)} links")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[isaaclab-dds] WARNING: could not bind a foot material ({exc}); "
+                  "the robot keeps the importer's default friction, so the effective "
+                  "coefficient is not the configured one")
 
     def _make_contact_sensor(self):
         """Real foot contact forces, so foot slip / duty factor mean the same
@@ -349,6 +437,7 @@ class IsaacLabDDSBackend(EvalBackend):
         )
         if verbose:
             print(f"[isaaclab-dds] PhysX actuator gains zeroed (residual {residual:.3g})")
+        self._apply_passive_joint_dynamics(verbose=verbose)
         if residual > 1e-6:
             print("[isaaclab-dds] WARNING: PhysX still has non-zero joint gains; the robot is "
                   "being driven by two PD loops and the results are invalid.")
@@ -638,16 +727,22 @@ PHYSICS_PARITY = {
         "static_friction": 1.0, "dynamic_friction": 1.0,
         "friction_combine_mode": "multiply", "restitution_combine_mode": "multiply",
         "replace_cylinders_with_capsules": True,
+        # training leaves the robot material to the importer; binding it would
+        # change the effective coefficient away from what the policy trained on
+        "bind_robot_material": False,
     },
     "mujoco": {
         "static_friction": 1.0, "dynamic_friction": 1.0,
         "friction_combine_mode": "max", "restitution_combine_mode": "max",
         "replace_cylinders_with_capsules": False,
+        # MuJoCo gives every geom friction 1.0, feet included
+        "bind_robot_material": True,
     },
     "default": {
         "static_friction": 0.5, "dynamic_friction": 0.5,
         "friction_combine_mode": "average", "restitution_combine_mode": "average",
         "replace_cylinders_with_capsules": None,
+        "bind_robot_material": False,
     },
 }
 

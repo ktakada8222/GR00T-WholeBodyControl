@@ -17,6 +17,13 @@
         0.0,
         -0.03
       ]
+    },
+    "joint_dynamics": {
+      "_comment": "MuJoCo <default> classes in g1_29dof_with_hand.xml. The Isaac URDF has no <dynamics> on any joint, so these have to be applied explicitly or the Isaac robot has zero passive damping and zero joint friction.",
+      "damping": 0.05,
+      "armature": 0.01,
+      "frictionloss": 0.2,
+      "frictionloss_wrist": 0.1
     }
   },
   "isaac_urdf": {
