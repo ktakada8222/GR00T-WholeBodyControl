@@ -116,6 +116,13 @@ class CommandConverter:
     #: True to clamp on our side instead, which makes the command we log equal
     #: to the command the planner receives.
     clamp_speed_to_mode: bool = False
+    #: Pin ``locomotion_mode`` instead of deriving it from the speed.  Needed
+    #: whenever the commanded speed varies within an episode (the sine
+    #: scenario): without it, crossing a mode boundary -- or passing through
+    #: zero -- switches the planner's mode mid-episode, which triggers a replan
+    #: (``movement_mode_changed`` in g1_deploy_onnx_ref.cpp) and measures the
+    #: mode transition instead of the velocity-tracking response.
+    forced_mode: int | None = None
     yaw_cmd: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
@@ -135,16 +142,19 @@ class CommandConverter:
         facing = (c, s, 0.0)
 
         speed = cmd.speed
-        mode = select_mode(speed)
-        if mode == LocomotionMode.IDLE:
+        mode = self.forced_mode if self.forced_mode is not None else select_mode(speed)
+        if mode == LocomotionMode.IDLE or (self.forced_mode is None and speed < 1e-3):
             # Stationary (possibly turning in place): zero movement vector, and
             # speed 0 rather than -1 so the planner does not fall back to the
             # mode default speed.
             return MovementState(mode, (0.0, 0.0, 0.0), facing, 0.0, self.height)
 
-        if self.clamp_speed_to_mode:
+        if self.clamp_speed_to_mode and mode in MODE_SPEED_RANGES:
             lo, hi = MODE_SPEED_RANGES[mode]
             speed = min(max(speed, lo), hi)
+
+        if speed < 1e-9:  # pinned mode, momentary zero crossing of a sine
+            return MovementState(mode, (0.0, 0.0, 0.0), facing, 0.0, self.height)
 
         # Rotate the body-frame direction into the world frame.
         ux, uy = cmd.vx / cmd.speed, cmd.vy / cmd.speed

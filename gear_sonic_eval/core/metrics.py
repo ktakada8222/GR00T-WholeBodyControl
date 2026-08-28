@@ -64,6 +64,12 @@ class EpisodeRecord:
     fall_time: float = float("nan")
     duration: float = 0.0
     notes: str = ""
+    #: "const" or "sine"; sine episodes additionally yield a tracking lag.
+    waveform: str = "const"
+    #: Primary command axis ("vx" / "vy" / "yaw_rate"), set by the runner.
+    axis: str = "vx"
+    #: Sine frequency [Hz] (0 for constant commands).
+    frequency: float = 0.0
 
     def add(self, sample: StepSample) -> None:
         self.samples.append(sample)
@@ -211,6 +217,44 @@ def gait_metrics(rec: EpisodeRecord, dt: float, mask: np.ndarray) -> dict[str, f
     return out
 
 
+def base_jerk(pos: np.ndarray, dt: float, mask: np.ndarray) -> float:
+    """Mean |3rd position difference| of the base [m/s^3].
+
+    Same estimator as ``run_sweep`` in IsaacLab's ``eval_locomotion.py``:
+    ``(p_t - 3 p_{t-1} + 3 p_{t-2} - p_{t-3}) / dt^3``.
+    """
+    if pos.shape[0] < 4:
+        return _nan()
+    j = (pos[3:] - 3 * pos[2:-1] + 3 * pos[1:-2] - pos[:-3]) / dt**3
+    m = mask[3:] if mask.shape[0] == pos.shape[0] else np.ones(j.shape[0], dtype=bool)
+    if not m.any():
+        return _nan()
+    return float(np.linalg.norm(j[m], axis=-1).mean())
+
+
+def tracking_lag(cmd: np.ndarray, actual: np.ndarray, dt: float, max_lag: float = 0.6) -> float:
+    """Cross-correlation lag [s] between command and response (eval.md 1-4).
+
+    Identical search to ``run_sine``: both signals are mean-centred and the lag
+    maximising their dot product over ``0..max_lag`` is returned.
+    """
+    n = min(cmd.size, actual.size)
+    if n < 10:
+        return _nan()
+    c = cmd[:n] - cmd[:n].mean()
+    if np.allclose(c, 0.0):  # constant command: lag is undefined
+        return _nan()
+    best, best_val = 0, -np.inf
+    for lag in range(0, int(round(max_lag / dt)) + 1):
+        if n - lag < 10:
+            break
+        a = actual[lag:n]
+        corr = float(np.dot(c[: n - lag], a - a.mean()))
+        if corr > best_val:
+            best_val, best = corr, lag
+    return float(best * dt)
+
+
 def compute_metrics(rec: EpisodeRecord, *, transient: float, dt: float, mass: float | None = None) -> dict:
     """Reduce one episode to the flat scalar row written to the result CSVs."""
     ts = rec.timeseries()
@@ -280,6 +324,18 @@ def compute_metrics(rec: EpisodeRecord, *, transient: float, dt: float, mass: fl
         step = rise_settling_overshoot(t, ts[key], target, t0)
         for k, v in step.items():
             row[f"{axis}_{k}"] = v
+
+    pos = rec.array("base_pos")
+    row["jerk_base"] = base_jerk(pos, dt, mask) if pos.size else _nan()
+
+    row["waveform"] = rec.waveform
+    row["axis"] = rec.axis
+    row["frequency"] = rec.frequency
+    if rec.waveform == "sine":
+        key = rec.axis
+        row["tracking_lag"] = tracking_lag(ts[f"cmd_{key}"], ts[key], dt)
+    else:
+        row["tracking_lag"] = _nan()
 
     # ------------------------------------------------------------------ gait
     row.update(gait_metrics(rec, dt, mask))

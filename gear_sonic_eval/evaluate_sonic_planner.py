@@ -46,6 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--visualize", action="store_true", help="Open the simulator viewer.")
     p.add_argument("--real-time", action="store_true", help="Throttle MuJoCo to wall-clock time.")
     p.add_argument("--no-plots", action="store_true", help="Skip plot generation.")
+    p.add_argument("--no-isaaclab-report", action="store_true",
+                   help="Skip the eval.npz/eval.json export used by report_locomotion.py.")
     p.add_argument("--no-timeseries", action="store_true", help="Do not dump per-step CSVs.")
     p.add_argument("--dry-run", action="store_true",
                    help="Print the episode manifest and exit (no simulator needed).")
@@ -109,6 +111,17 @@ def main(argv=None) -> int:
         )
     finally:
         backend.close()
+
+    if not args.no_isaaclab_report:
+        from gear_sonic_eval.core.isaaclab_report import export
+
+        npz_path, json_path = export(
+            writer.root, task=f"gear_sonic_planner_{args.sim}", run_info=backend.info
+        )
+        print(f"\nIsaacLab-format export: {npz_path.name}, {json_path.name}")
+        print("  generate report.md (identical format to the G1 RL benchmark) with:")
+        print(f"  python <IsaacLab>/scripts/reinforcement_learning/rsl_rl/report_locomotion.py \\")
+        print(f"      --inputs sonic={writer.root} --out {args.output_dir}")
 
     if not args.no_plots:
         try:

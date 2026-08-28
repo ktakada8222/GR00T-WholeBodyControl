@@ -65,6 +65,24 @@ def test_yaw_rate_integrates_heading():
     approx(s.movement_speed, 0.0)
 
 
+def test_pinned_mode_survives_sine_sweep():
+    """A sine that crosses a mode boundary / zero must not switch the mode."""
+    from gear_sonic_eval.core.commands import CommandConverter as CC
+
+    free, pinned = CC(), CC(forced_mode=LocomotionMode.SLOW_WALK)
+    # 0.2 .. 1.0 m/s crosses the SLOW_WALK / WALK boundary at 0.8
+    modes_free = {free.to_movement_state(VelocityCommand(vx=v)).locomotion_mode
+                  for v in (0.2, 0.6, 0.9, 1.0)}
+    modes_pinned = {pinned.to_movement_state(VelocityCommand(vx=v)).locomotion_mode
+                    for v in (0.2, 0.6, 0.9, 1.0)}
+    assert len(modes_free) > 1  # this is the problem the pin solves
+    assert modes_pinned == {LocomotionMode.SLOW_WALK}
+    # zero crossing of a lateral sine keeps the mode too, with speed 0
+    zero = pinned.to_movement_state(VelocityCommand(vy=0.0))
+    assert zero.locomotion_mode == LocomotionMode.SLOW_WALK
+    approx(zero.movement_speed, 0.0)
+
+
 def test_compound_command_direction():
     c = CommandConverter()
     cmd = VelocityCommand(vx=0.5, vy=0.3)

@@ -1,0 +1,73 @@
+# Sonic planner benchmark laid out to match IsaacLab's eval.md scenarios, so the
+# export in results/<backend>/eval.{npz,json} can be fed straight into
+#   IsaacLab/scripts/reinforcement_learning/rsl_rl/report_locomotion.py
+# and reported side by side with the G1 RL policy.
+#
+#   sweep  : constant commands per axis  -> steady-state error, RMSE, tilt, slip, CoT, jerk, falls
+#   step   : the 0 -> target transient of the same episodes -> rise / settle / overshoot
+#   sine   : sinusoidal commands         -> tracking lag
+#   push   : force grid at cruise speed  -> fall rate, recovery time
+#   circle : vx x yaw_rate grid          -> compound-command quality and falls
+name: sonic_eval_md_benchmark
+seed: 0
+num_episodes: 3          # >=3 so the 95% CI across seeds is meaningful
+
+sim:
+  control_dt: 0.02
+  physics_dt: 0.005
+  command_dt: 0.1
+  episode_duration: 12.0
+  settle_duration: 3.0
+  transient_duration: 1.5
+  real_time: false
+
+init: {base_height: 0.793, base_yaw: 0.0, joint_noise: 0.0}
+fall: {min_base_height: 0.4, max_tilt_deg: 50.0, hold_steps: 5}
+
+disturbance:
+  enabled: false         # --disturbance turns the push scenario on
+  forces: [100.0, 200.0, 300.0, 400.0]   # impulse = force * duration = 10..40 N*s
+  directions: [front, back, left, right]
+  duration: 0.1
+  time: 4.0
+  conditions: [forward_vx+0.40, forward_vx+0.80, forward_vx+1.20]  # push cruise speeds
+  include_baseline: true
+
+conditions:
+  # ---- sweep + step, per axis -------------------------------------------
+  - {group: forward,  sweep: vx,       values: [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.5, 2.0]}
+  - {group: backward, sweep: vx,       values: [-0.2, -0.4, -0.6, -0.8]}
+  - {group: lateral,  sweep: vy,       values: [-0.6, -0.4, -0.2, 0.2, 0.4, 0.6]}
+  - {group: turn,     sweep: yaw_rate, values: [-1.0, -0.5, -0.2, 0.2, 0.5, 1.0]}
+
+  # ---- sine (tracking lag): sweep is over FREQUENCY [Hz] -----------------
+  # locomotion_mode is pinned so a speed change inside the episode cannot switch
+  # the planner's mode (which would measure the mode transition, not tracking).
+  # vx stays inside SLOW_WALK's documented 0.1-0.8 m/s range: 0.5 +- 0.3.
+  - {group: sine_vx, sweep: vx,       values: [0.25, 0.5, 1.0], locomotion_mode: 1,
+     waveform: sine, center: 0.5, amplitude: 0.3, name_format: "sine_vx_f{value:.2f}"}
+  - {group: sine_vy, sweep: vy,       values: [0.25, 0.5, 1.0], locomotion_mode: 1,
+     waveform: sine, center: 0.0, amplitude: 0.4, name_format: "sine_vy_f{value:.2f}"}
+  # yaw-only: speed is 0 throughout, so the mode is IDLE with a rotating facing
+  # vector and nothing switches; same command layout as IsaacLab's sine wz.
+  - {group: sine_wz, sweep: yaw_rate, values: [0.25, 0.5, 1.0],
+     waveform: sine, center: 0.0, amplitude: 0.5, name_format: "sine_wz_f{value:.2f}"}
+
+  # ---- circle: compound vx x yaw_rate grid ------------------------------
+  - {group: circle, grid: [vx, yaw_rate], values: [[0.4, 0.8, 1.2], [-0.5, -0.2, 0.2, 0.5]]}
+
+backend:
+  mujoco:
+    zmq_port: 5556
+    interface: sim
+    startup_wait: 2.0
+    arm_wait: 8.0
+    settle_after_reset: 1.0
+    deploy_timeout: 120.0
+    elastic_band: false
+    real_time: true
+    stop_on_close: false
+  isaaclab:
+    mode: trajectory
+    task: Isaac-Velocity-Flat-G1-Play-v0
+    trajectory_dir: null

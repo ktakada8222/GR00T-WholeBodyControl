@@ -79,18 +79,59 @@ class DisturbanceConfig:
     #: from the episode RNG, which keeps it reproducible for a given seed.
 
 
+#: Command axis implied by a condition group (used by the report exporter).
+GROUP_AXIS = {
+    "forward": "vx",
+    "backward": "vx",
+    "lateral": "vy",
+    "turn": "yaw_rate",
+    "circle": "vx",
+}
+
+
 @dataclass
 class ConditionConfig:
-    """One benchmark condition = one constant velocity command."""
+    """One benchmark condition.
+
+    ``waveform: const`` holds ``(vx, vy, yaw_rate)`` for the whole episode.
+    ``waveform: sine`` additionally modulates ``axis`` as
+    ``center + amplitude * sin(2*pi*frequency*t)`` -- the eval.md 1-4 scenario
+    used to measure tracking lag.
+    """
 
     name: str
     vx: float = 0.0
     vy: float = 0.0
     yaw_rate: float = 0.0
-    group: str = "custom"  # forward / backward / lateral / turn / compound
+    group: str = "custom"  # forward / backward / lateral / turn / circle / compound
+    waveform: str = "const"  # const | sine
+    axis: str | None = None  # command axis; defaults from the group
+    amplitude: float = 0.0
+    frequency: float = 0.0
+    center: float = 0.0
+    #: Pin the planner's LocomotionMode for the whole episode
+    #: (0=IDLE, 1=SLOW_WALK, 2=WALK, 3=RUN). Required for sine conditions whose
+    #: speed crosses a mode boundary or passes through zero.
+    locomotion_mode: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.axis is None:
+            self.axis = GROUP_AXIS.get(self.group, "vx")
+        if self.waveform not in ("const", "sine"):
+            raise ValueError(f"unknown waveform '{self.waveform}' in condition {self.name}")
 
     def command(self) -> VelocityCommand:
-        return VelocityCommand(self.vx, self.vy, self.yaw_rate)
+        """Nominal (t = 0) command; for sine this is the DC offset."""
+        return self.command_at(0.0)
+
+    def command_at(self, t: float) -> VelocityCommand:
+        """Command in force ``t`` seconds after the command phase starts."""
+        values = {"vx": self.vx, "vy": self.vy, "yaw_rate": self.yaw_rate}
+        if self.waveform == "sine":
+            values[self.axis] = self.center + self.amplitude * math.sin(
+                2.0 * math.pi * self.frequency * t
+            )
+        return VelocityCommand(values["vx"], values["vy"], values["yaw_rate"])
 
 
 @dataclass
@@ -183,17 +224,30 @@ def _expand_conditions(raw: list) -> list[ConditionConfig]:
     """
     conditions: list[ConditionConfig] = []
     for entry in raw:
-        if "sweep" in entry:
+        if "grid" in entry:
+            conditions.extend(_expand_grid(entry))
+        elif "sweep" in entry:
             axis = entry["sweep"]
             group = entry.get("group", axis)
             base = {k: entry.get(k, 0.0) for k in ("vx", "vy", "yaw_rate")}
+            extra = {k: entry[k] for k in
+                     ("waveform", "amplitude", "frequency", "center", "locomotion_mode")
+                     if k in entry}
             for value in entry["values"]:
                 kwargs = dict(base)
-                kwargs[axis] = float(value)
-                name = entry.get("name_format", "{group}_{axis}{value:+.2f}").format(
+                if entry.get("waveform") == "sine":
+                    # sweep over frequencies rather than over the command value
+                    extra["frequency"] = float(value)
+                    name_default = "{group}_f{value:.2f}"
+                else:
+                    kwargs[axis] = float(value)
+                    name_default = "{group}_{axis}{value:+.2f}"
+                name = entry.get("name_format", name_default).format(
                     group=group, axis=axis, value=float(value)
                 )
-                conditions.append(ConditionConfig(name=name, group=group, **kwargs))
+                conditions.append(
+                    ConditionConfig(name=name, group=group, axis=axis, **kwargs, **extra)
+                )
         else:
             entry = dict(entry)
             entry.setdefault(
@@ -206,6 +260,29 @@ def _expand_conditions(raw: list) -> list[ConditionConfig]:
             )
             conditions.append(ConditionConfig(**entry))
     return conditions
+
+
+def _expand_grid(entry: dict) -> list[ConditionConfig]:
+    """Expand a 2-axis grid entry, e.g. the circle scenario::
+
+        - group: circle
+          grid: [vx, yaw_rate]
+          values: [[0.4, 0.8], [-0.5, 0.0, 0.5]]
+    """
+    ax_a, ax_b = entry["grid"]
+    vals_a, vals_b = entry["values"]
+    group = entry.get("group", "circle")
+    out = []
+    for a in vals_a:
+        for b in vals_b:
+            kwargs = {k: entry.get(k, 0.0) for k in ("vx", "vy", "yaw_rate")}
+            kwargs[ax_a] = float(a)
+            kwargs[ax_b] = float(b)
+            name = entry.get("name_format", "{group}_{a:+.2f}_{b:+.2f}").format(
+                group=group, a=float(a), b=float(b)
+            )
+            out.append(ConditionConfig(name=name, group=group, axis=ax_a, **kwargs))
+    return out
 
 
 def direction_to_world_force(direction: str, force: float, yaw: float, rng) -> tuple[float, float, float]:

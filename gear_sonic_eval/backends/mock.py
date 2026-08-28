@@ -25,7 +25,8 @@ class MockBackend(EvalBackend):
     def __init__(self, config):
         super().__init__(config)
         self.dt = config.sim.control_dt
-        self.info = {"backend": "mock", "warning": "analytic placeholder, not a simulator"}
+        self.info = {"backend": "mock", "mass_kg": self.mass,
+                     "warning": "analytic placeholder, not a simulator"}
         self.reset(config.seed)
 
     def reset(self, seed: int) -> None:

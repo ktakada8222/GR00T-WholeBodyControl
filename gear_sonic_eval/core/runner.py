@@ -41,7 +41,9 @@ def run_episode(
     backend.reset(seed)
     backend.begin_episode(condition, disturbance)
 
-    converter = CommandConverter(initial_yaw=config.init.base_yaw, height=-1.0)
+    converter = CommandConverter(
+        initial_yaw=config.init.base_yaw, height=-1.0, forced_mode=condition.locomotion_mode
+    )
     converter.reset(config.init.base_yaw)
 
     record = EpisodeRecord(
@@ -55,7 +57,9 @@ def run_episode(
     )
 
     idle = VelocityCommand(0.0, 0.0, 0.0)
-    cmd = condition.command()
+    record.waveform = condition.waveform
+    record.axis = condition.axis
+    record.frequency = condition.frequency
 
     n_settle = int(round(sim.settle_duration / sim.control_dt))
     n_episode = int(round(sim.episode_duration / sim.control_dt))
@@ -69,16 +73,16 @@ def run_episode(
     fall_counter = 0
     t_wall = time.monotonic()
 
+    # The command actually in force between two sends (the planner receives a
+    # 10 Hz staircase, so that -- not the continuous ideal -- is what we log).
+    current = idle
     for i in range(-n_settle, n_episode):
         active = i >= 0
-        current = cmd if active else idle
 
         if (i + n_settle) % command_every == 0:
+            current = condition.command_at(i * sim.control_dt) if active else idle
             state = converter.step(current, sim.command_dt if active else 0.0)
             backend.send_movement_state(state)
-        elif active:
-            # keep the integrated heading in sync with wall time even between sends
-            pass
 
         pushing = bool(disturbance) and active and push_start <= i < push_end
         if pushing:
