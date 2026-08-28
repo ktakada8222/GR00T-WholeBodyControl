@@ -246,6 +246,8 @@ class IsaacLabDDSBackend(EvalBackend):
         per-link masses and inertia tensors still differ, so CoT and push
         results remain only approximately comparable.
         """
+        import torch
+
         ref = _load_physics_reference()
         target = float(ref["mujoco"]["total_mass_kg"])
         view = self.robot.root_physx_view
@@ -254,8 +256,19 @@ class IsaacLabDDSBackend(EvalBackend):
         if current <= 0.0:
             return 1.0
         scale = target / current
-        view.set_masses(masses * scale, indices=None)
-        print(f"[isaaclab-dds] mass matched to MuJoCo: {current:.3f} -> "
+        # set_masses/set_inertias need an explicit index tensor (indices=None is
+        # not accepted by omni.physics.tensors).
+        env_ids = torch.arange(masses.shape[0], dtype=torch.int32)
+        view.set_masses(masses * scale, env_ids)
+        # Inertia is stored separately: scaling mass alone would leave the
+        # rotational dynamics inconsistent with the new mass.
+        try:
+            inertias = view.get_inertias()
+            view.set_inertias(inertias * scale, env_ids)
+            inertia_note = "mass+inertia"
+        except Exception as exc:  # noqa: BLE001
+            inertia_note = f"mass only (inertia unchanged: {exc})"
+        print(f"[isaaclab-dds] {inertia_note} matched to MuJoCo: {current:.3f} -> "
               f"{current * scale:.3f} kg (x{scale:.4f})")
         return scale
 
