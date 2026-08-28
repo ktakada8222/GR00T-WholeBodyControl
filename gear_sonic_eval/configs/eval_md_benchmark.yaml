@@ -82,3 +82,11 @@ backend:
     real_time: true
     check_order: false   # true (or --check-order) prints the joint mapping
     reset_joints: true   # false = keep the controller's pose, reset only the base
+    # What this run is meant to be comparable with:
+    #   training = the policy's own training physics (friction 1.0 multiply,
+    #              capsule feet) -- the IsaacLab-native reading
+    #   mujoco   = pushed toward the MuJoCo model (friction 1.0 max, cylinder
+    #              feet, total mass scaled 34.39 -> 36.17 kg) -- for sim-to-sim
+    #   default  = IsaacLab defaults (friction 0.5 average); earlier runs used this
+    physics_parity: mujoco
+    match_mujoco_mass: true   # implied by physics_parity: mujoco

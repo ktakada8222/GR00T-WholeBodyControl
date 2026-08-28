@@ -154,6 +154,29 @@ python gear_sonic_eval/evaluate_sonic_planner.py --sim isaaclab \
     --conditions forward_vx+0.40 --check-order --headless
 ```
 
+#### Closing the sim-to-sim gap
+
+The two robot models are not the same asset, so the Isaac scene has to be
+steered explicitly.  `backend.isaaclab.physics_parity` picks the target:
+
+| | `training` | `mujoco` | `default` |
+|---|---|---|---|
+| ground friction | 1.0 / 1.0, **multiply** (as in `modular_tracking_env_cfg.py`) | 1.0 / 1.0, **max** (MuJoCo combines with max, and its scene sets `geom friction="1.0"`) | 0.5 / 0.5, average (IsaacLab default) |
+| foot collision | capsules (`replace_cylinders_with_capsules=True`, as trained) | cylinders — MuJoCo's sole is a flat `box 0.17x0.06x0.01` | asset default |
+| total mass | 34.39 kg (URDF) | scaled to 36.17 kg (MuJoCo) | 34.39 kg |
+
+Measured constants live in `configs/g1_physics_reference.json`
+(`tools/dump_physics_reference.py` re-derives them).  What still cannot be
+matched: per-link mass distribution and inertia tensors (the URDF splits off
+`head_link`, `logo_link`, hand palms, ... where MuJoCo folds them into the
+parent), and the exact sole geometry — MuJoCo's single flat box against the
+URDF's seven thin cylinders.  `run_info.json` records the settings actually
+used, so a report always states which physics produced it.
+
+Foot contact uses a real `ContactSensor` (threshold 1 N, the same as
+`eval_locomotion.py`), falling back to a foot-height heuristic only if the
+sensor cannot be created; `run_info.json`'s `contact_detection` says which.
+
 Run it the same way as MuJoCo — one terminal for the benchmark, one for the
 deploy binary — but **never both simulators at once**: they would both publish
 `rt/lowstate` on the same DDS domain.

@@ -1,0 +1,41 @@
+{
+  "_comment": "Physical reference values extracted from the two G1 models, used by the IsaacLab backend to reduce the sim-to-sim gap. Regenerate with tools/dump_physics_reference.py.",
+  "mujoco": {
+    "_source": "gear_sonic/data/robot_model/model_data/g1/{scene_43dof,g1_29dof_with_hand}.xml",
+    "total_mass_kg": 36.1652,
+    "geom_friction_slide": 1.0,
+    "friction_combine": "max",
+    "foot_collision": {
+      "type": "box",
+      "half_size": [
+        0.085,
+        0.03,
+        0.005
+      ],
+      "pos": [
+        0.035,
+        0.0,
+        -0.03
+      ]
+    }
+  },
+  "isaac_urdf": {
+    "_source": "gear_sonic/data/assets/robot_description/urdf/g1/main.urdf",
+    "total_mass_kg": 34.3942,
+    "foot_collision": {
+      "type": "7 cylinders",
+      "radius_range": [
+        0.008,
+        0.01
+      ]
+    }
+  },
+  "training_env": {
+    "_source": "gear_sonic/envs/manager_env/modular_tracking_env_cfg.py",
+    "static_friction": 1.0,
+    "dynamic_friction": 1.0,
+    "friction_combine_mode": "multiply",
+    "restitution_combine_mode": "multiply",
+    "sim_dt": 0.005
+  }
+}

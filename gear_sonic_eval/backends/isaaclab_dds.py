@@ -50,6 +50,9 @@ from gear_sonic_eval.core.metrics import StepSample
 
 MOTOR_ORDER_FILE = Path(__file__).resolve().parent.parent / "configs" / "g1_motor_order.json"
 FOOT_JOINT_PATTERN = ".*ankle_roll.*"
+#: Net force [N] above which a foot counts as in contact. Matches the default
+#: of IsaacLab's eval_locomotion.py (--contact_force 1.0).
+CONTACT_FORCE_THRESHOLD = 1.0
 
 
 def load_motor_order() -> dict:
@@ -85,6 +88,13 @@ class IsaacLabDDSBackend(EvalBackend):
         # PD spike can collapse the robot during the settle phase. false keeps
         # the current joint pose and resets only the base.
         self.reset_joints = bool(cfg.get("reset_joints", True))
+        # Which simulator this run is supposed to be comparable with. See
+        # PHYSICS_PARITY in this module and configs/g1_physics_reference.json.
+        self.physics_parity = cfg.get("physics_parity", "training")
+        if self.physics_parity not in ("training", "mujoco", "default"):
+            raise ValueError(f"unknown physics_parity: {self.physics_parity}")
+        self.match_mass = bool(cfg.get("match_mujoco_mass",
+                                       self.physics_parity == "mujoco"))
         config.sim.real_time = False  # paced here, per physics step
 
         _preflight()
@@ -118,7 +128,17 @@ class IsaacLabDDSBackend(EvalBackend):
         self.sim_dt = physics_dt
         self.substeps = max(int(round(self.config.sim.control_dt / physics_dt)), 1)
 
-        sim_utils.GroundPlaneCfg().func("/World/ground", sim_utils.GroundPlaneCfg())
+        parity = PHYSICS_PARITY[self.physics_parity]
+        ground_cfg = sim_utils.GroundPlaneCfg(
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=parity["static_friction"],
+                dynamic_friction=parity["dynamic_friction"],
+                restitution=0.0,
+                friction_combine_mode=parity["friction_combine_mode"],
+                restitution_combine_mode=parity["restitution_combine_mode"],
+            )
+        )
+        ground_cfg.func("/World/ground", ground_cfg)
         sim_utils.DomeLightCfg(intensity=2000.0).func(
             "/World/Light", sim_utils.DomeLightCfg(intensity=2000.0)
         )
@@ -128,6 +148,12 @@ class IsaacLabDDSBackend(EvalBackend):
 
         robot_cfg = getattr(importlib.import_module(module_name), attr).copy()
         robot_cfg.prim_path = "/World/Robot"
+        if parity["replace_cylinders_with_capsules"] is not None and hasattr(
+            robot_cfg.spawn, "replace_cylinders_with_capsules"
+        ):
+            robot_cfg.spawn.replace_cylinders_with_capsules = parity[
+                "replace_cylinders_with_capsules"
+            ]
         robot_cfg.init_state.pos = (
             self.config.init.base_xy[0],
             self.config.init.base_xy[1],
@@ -139,12 +165,13 @@ class IsaacLabDDSBackend(EvalBackend):
         self._resolve_joint_order()
         self._zero_actuator_gains()
         self.mass = float(self.robot.root_physx_view.get_masses()[0].sum().item())
+        self.mass_scale = 1.0
+        if self.match_mass:
+            self.mass_scale = self._match_mujoco_mass()
+            self.mass = float(self.robot.root_physx_view.get_masses()[0].sum().item())
         foot_ids, foot_names = self.robot.find_bodies(FOOT_JOINT_PATTERN)
         self.foot_ids, self.foot_names = foot_ids, foot_names
-        try:
-            self.contact_sensor = self.robot  # contact forces via the articulation view
-        except Exception:  # noqa: BLE001
-            self.contact_sensor = None
+        self.contact_sensor = self._make_contact_sensor()
 
         self.info = {
             "backend": "isaaclab",
@@ -155,6 +182,12 @@ class IsaacLabDDSBackend(EvalBackend):
             "mass_kg": self.mass,
             "zmq_endpoint": f"tcp://{self.zmq_host}:{self.zmq_port}",
             "requires": "g1_deploy_onnx_ref --input-type zmq_manager on the same DDS domain",
+            "physics_parity": self.physics_parity,
+            "static_friction": parity["static_friction"],
+            "friction_combine_mode": parity["friction_combine_mode"],
+            "replace_cylinders_with_capsules": parity["replace_cylinders_with_capsules"],
+            "mass_scale": self.mass_scale,
+            "contact_detection": "sensor" if self.contact_sensor is not None else "foot_height",
             "headless": self.headless,
             "render_fps": self.render_fps if not self.headless else 0.0,
         }
@@ -177,6 +210,54 @@ class IsaacLabDDSBackend(EvalBackend):
             print("[isaaclab-dds] DDS motor -> Isaac joint mapping")
             for i, (name, idx) in enumerate(zip(resolved, ids)):
                 print(f"  motor {i:2d} {name:32s} -> isaac joint {idx}")
+
+    def _make_contact_sensor(self):
+        """Real foot contact forces, so foot slip / duty factor mean the same
+        thing here as in MuJoCo (which uses actual contacts).
+
+        Falls back to a foot-height heuristic if the sensor cannot be created;
+        ``run_info.json`` records which one was used.
+        """
+        try:
+            from isaaclab.sensors import ContactSensor, ContactSensorCfg
+
+            cfg = ContactSensorCfg(
+                prim_path="/World/Robot/.*ankle_roll.*",
+                update_period=0.0,
+                history_length=0,
+                track_air_time=False,
+            )
+            sensor = ContactSensor(cfg)
+            self.sim.reset()
+            print(f"[isaaclab-dds] contact sensor active on {sensor.num_instances} feet")
+            return sensor
+        except Exception as exc:  # noqa: BLE001
+            print(f"[isaaclab-dds] contact sensor unavailable ({exc}); "
+                  "falling back to a foot-height contact heuristic")
+            return None
+
+    def _match_mujoco_mass(self) -> float:
+        """Scale every body mass so the robot's total matches the MuJoCo model.
+
+        The two assets partition the robot differently (the URDF splits off
+        head_link, logo_link, hand palms, ... while MuJoCo folds them into the
+        parent), and the URDF totals 34.394 kg against MuJoCo's 36.165 kg.  A
+        uniform scale fixes the total and leaves the URDF's distribution intact;
+        per-link masses and inertia tensors still differ, so CoT and push
+        results remain only approximately comparable.
+        """
+        ref = _load_physics_reference()
+        target = float(ref["mujoco"]["total_mass_kg"])
+        view = self.robot.root_physx_view
+        masses = view.get_masses()
+        current = float(masses[0].sum().item())
+        if current <= 0.0:
+            return 1.0
+        scale = target / current
+        view.set_masses(masses * scale, indices=None)
+        print(f"[isaaclab-dds] mass matched to MuJoCo: {current:.3f} -> "
+              f"{current * scale:.3f} kg (x{scale:.4f})")
+        return scale
 
     def _zero_actuator_gains(self) -> None:
         """PhysX must not run its own PD: the deploy binary's kp/kd are the only ones."""
@@ -304,6 +385,8 @@ class IsaacLabDDSBackend(EvalBackend):
         )
         self.sim.step(render=bool(render))
         self.robot.update(self.sim_dt)
+        if self.contact_sensor is not None:
+            self.contact_sensor.update(self.sim_dt)
 
         if self.pace_real_time:
             now = time.monotonic()
@@ -390,8 +473,12 @@ class IsaacLabDDSBackend(EvalBackend):
         contacts, foot_pos = None, None
         if self.foot_ids:
             foot_pos = d.body_pos_w[0, self.foot_ids, :].cpu().numpy()
-            # No ContactSensor in this minimal scene: infer stance from foot height.
-            contacts = (foot_pos[:, 2] < 0.06).astype(float).tolist()
+            if self.contact_sensor is not None:
+                forces = self.contact_sensor.data.net_forces_w[0].cpu().numpy()
+                contacts = (np.linalg.norm(forces, axis=-1) > CONTACT_FORCE_THRESHOLD
+                            ).astype(float).tolist()
+            else:
+                contacts = (foot_pos[:, 2] < 0.06).astype(float).tolist()
         return StepSample(
             t=self.t,
             cmd_vx=0.0, cmd_vy=0.0, cmd_yaw_rate=0.0,
@@ -417,6 +504,47 @@ class IsaacLabDDSBackend(EvalBackend):
             self.socket = None
         if getattr(self, "_app", None) is not None:
             self._app.close()
+
+
+def _load_physics_reference() -> dict:
+    return json.loads(
+        (Path(__file__).resolve().parent.parent / "configs" / "g1_physics_reference.json").read_text()
+    )
+
+
+#: What "comparable" means for this run.
+#:
+#: ``training`` reproduces the environment the WBC policy was trained in
+#: (gear_sonic/envs/manager_env/modular_tracking_env_cfg.py: friction 1.0/1.0
+#: combined by multiply, capsule feet).  Numbers are then interpretable as
+#: "how the planner behaves in its own training physics".
+#:
+#: ``mujoco`` moves the Isaac scene toward the MuJoCo model instead: MuJoCo
+#: gives every geom ``friction="1.0"`` and combines with max, so the effective
+#: coefficient is 1.0 rather than the product with the robot material; the
+#: cylinder->capsule replacement is switched off because MuJoCo's sole is a flat
+#: box; and the total robot mass is scaled to the MuJoCo model's.  Use it when
+#: the point of the run is a like-for-like MuJoCo/Isaac comparison.
+#:
+#: ``default`` is IsaacLab's own defaults (static/dynamic friction 0.5, average
+#: combine) -- kept only to reproduce earlier runs.
+PHYSICS_PARITY = {
+    "training": {
+        "static_friction": 1.0, "dynamic_friction": 1.0,
+        "friction_combine_mode": "multiply", "restitution_combine_mode": "multiply",
+        "replace_cylinders_with_capsules": True,
+    },
+    "mujoco": {
+        "static_friction": 1.0, "dynamic_friction": 1.0,
+        "friction_combine_mode": "max", "restitution_combine_mode": "max",
+        "replace_cylinders_with_capsules": False,
+    },
+    "default": {
+        "static_friction": 0.5, "dynamic_friction": 0.5,
+        "friction_combine_mode": "average", "restitution_combine_mode": "average",
+        "replace_cylinders_with_capsules": None,
+    },
+}
 
 
 def _preflight() -> None:
