@@ -91,7 +91,8 @@ The manual workflow is 2 terminals + key presses:
 | Terminal 1: `python gear_sonic/scripts/run_sim_loop.py` | **replaced** by `evaluate_sonic_planner.py --sim mujoco` (the benchmark *is* the simulator, so it can step deterministically, reset per episode and apply pushes) |
 | Terminal 2: `bash deploy.sh --input-type keyboard sim` | `bash deploy.sh --input-type zmq_manager sim` |
 | `]` (start policy) | `command{start=true, stop=false, planner=true}` on the ZMQ `command` topic |
-| `Enter` (planner mode) | same message — `ZMQManager::handlePlannerInput` enables the planner and waits for its init |
+| `Enter` (planner mode) | same message — `ZMQManager::handlePlannerInput` enables the planner and waits for its init. Sent **once per run**, not per episode |
+| `O` / Ctrl-C (stop) | never sent between episodes: `stop` sets `operator_state.stop`, which `main()` loops on, so it kills the deploy process |
 | `9` in MuJoCo (release elastic band) | the band is disabled in code (`backend.mujoco.elastic_band: false`) |
 | W/A/S/D/Q/E (movement keys) | `planner` topic messages generated from the config's `(vx, vy, yaw_rate)` grid |
 

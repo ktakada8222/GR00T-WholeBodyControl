@@ -51,8 +51,10 @@ backend:
     wbc_version: sonic_model12
     interface: sim
     startup_wait: 2.0    # wait after LowCmd is first seen (deploy INIT ramp)
-    rearm_wait: 3.0      # time given to the deploy binary to re-init the planner
+    arm_wait: 8.0        # after command{start,planner}: planner init can take 5 s
+    settle_after_reset: 1.0  # hold IDLE after the teleport, before recording
     deploy_timeout: 120.0  # how long to wait for the deploy binary at startup
+    stop_on_close: false # a "stop" command terminates the deploy process
     elastic_band: false  # the "9" key band must stay off during evaluation
     real_time: true      # the deploy binary is a wall-clock 50 Hz process
   isaaclab:

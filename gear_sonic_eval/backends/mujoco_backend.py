@@ -26,6 +26,15 @@ the MuJoCo window; a benchmark must not depend on a key press, and
 ``DefaultEnv.sim_step`` zeroes ``xfrc_applied`` on the band body every step,
 which would silently cancel the push forces.
 
+**Episode resets do not restart the controller.** On the ZMQ ``command`` topic a
+``stop`` sets ``operator_state.stop``, which is what ``main()`` loops on, so it
+terminates the deploy *process*.  The benchmark therefore arms the controller
+once (``prepare``) and resets an episode by teleporting the robot back to the
+configured initial state while commanding IDLE.  Consequence to keep in mind
+when reading results: the planner's internal motion buffer and the WBC policy's
+observation history carry over between episodes, so episodes are not fully
+independent; the ``settle_duration`` window exists to absorb that.
+
 Push disturbances use ``mj_data.xfrc_applied[pelvis]`` (a real MuJoCo API, held
 for ``duration`` seconds so the impulse is force*duration).  ``apply_perturbation``
 in ``base_sim.py`` was *not* reused because it adds an instantaneous velocity
@@ -78,8 +87,14 @@ class MujocoBackend(EvalBackend):
         backend_cfg = dict(config.backend.get("mujoco", {}))
         self.zmq_port = int(backend_cfg.get("zmq_port", 5556))
         self.zmq_host = backend_cfg.get("zmq_host", "*")
-        self.rearm_wait = float(backend_cfg.get("rearm_wait", 3.0))
+        self.arm_wait = float(backend_cfg.get("arm_wait", 8.0))
+        self.settle_after_reset = float(backend_cfg.get("settle_after_reset", 1.0))
         self.startup_wait = float(backend_cfg.get("startup_wait", 2.0))
+        self.reset_joints = bool(backend_cfg.get("reset_joints", True))
+        # A "stop" command terminates the deploy PROCESS (main() loops on
+        # !operator_state.stop), so it is never used between episodes and only
+        # optionally at the very end.
+        self.stop_on_close = bool(backend_cfg.get("stop_on_close", False))
         self.deploy_timeout = float(backend_cfg.get("deploy_timeout", 120.0))
         self.use_elastic_band = bool(backend_cfg.get("elastic_band", False))
         # The controller is an external real-time process (its Control thread
@@ -195,20 +210,38 @@ class MujocoBackend(EvalBackend):
         return False
 
     def prepare(self) -> None:
-        if not self._armed:
-            self.wait_for_deploy()
-            self._armed = True
+        """Wait for the deploy binary, then arm it once for the whole run.
+
+        ``command{start=true, planner=true}`` is the ZMQ equivalent of pressing
+        ``]`` and ``Enter``: ``ZMQManager::handlePlannerInput`` sets
+        ``operator_state.start``, enables the planner and blocks (up to 5 s)
+        until the planner has produced its first motion -- which only happens
+        while this simulator keeps publishing LowState, so we keep stepping.
+
+        It is sent exactly once: ``start_control_`` is only acted on while
+        ``!operator_state.start``, so later start messages are no-ops.
+        """
+        if self._armed:
+            return
+        self.wait_for_deploy()
+        print("arming the controller (command{start=true, planner=true}) ...")
+        self._send_command(start=True, stop=False, planner=True)
+        deadline = time.monotonic() + self.arm_wait
+        while time.monotonic() < deadline:
+            self._physics_step()
+        self._armed = True
 
     def reset(self, seed: int) -> None:
         rng = np.random.default_rng(seed)
         init = self.config.init
 
-        # Stop the controller, restore the initial state, re-arm in planner mode.
-        self._send_command(start=False, stop=True)
-        time.sleep(0.2)
-
+        # The controller keeps running across episodes (a stop would kill it), so
+        # an episode reset is: teleport the robot back to the configured initial
+        # state and let it settle while the runner commands IDLE. The planner's
+        # own motion buffer is NOT reset -- see the module docstring.
         self.mujoco.mj_resetData(self.model, self.data)
-        self.data.qpos[:] = self._qpos0
+        if self.reset_joints:
+            self.data.qpos[:] = self._qpos0
         self.data.qpos[0:2] = init.base_xy
         self.data.qpos[2] = init.base_height
         self.data.qpos[3:7] = _yaw_quat(init.base_yaw)
@@ -223,10 +256,12 @@ class MujocoBackend(EvalBackend):
         self.wrapper.fall = False
         self._push = np.zeros(3)
         self.t = 0.0
+        self._next_step_wall = None
 
-        self._send_command(start=True, stop=False, planner=True)
-        # let the deploy binary ramp to the default pose and initialise the planner
-        deadline = time.monotonic() + self.rearm_wait
+        # Hold the IDLE command briefly so the teleport transient decays before
+        # the runner's settle phase starts recording.
+        self.send_movement_state(_idle_state())
+        deadline = time.monotonic() + self.settle_after_reset
         while time.monotonic() < deadline:
             self._physics_step()
 
@@ -296,9 +331,12 @@ class MujocoBackend(EvalBackend):
         socket = getattr(self, "socket", None)
         if socket is not None:
             try:
-                self._send_command(start=False, stop=True)
+                # Leave the robot standing; only kill the deploy process if asked.
+                self.send_movement_state(_idle_state())
+                if self.stop_on_close:
+                    self._send_command(start=False, stop=True)
             except Exception as exc:  # noqa: BLE001 - teardown must not mask errors
-                print(f"[mujoco backend] could not send stop command: {exc}")
+                print(f"[mujoco backend] could not send final command: {exc}")
             socket.close(linger=200)
             self.socket = None
         env = getattr(self, "env", None)
@@ -309,6 +347,11 @@ class MujocoBackend(EvalBackend):
 
 
 # ------------------------------------------------------------------- helpers
+def _idle_state() -> MovementState:
+    """IDLE, stationary, mode-default height."""
+    return MovementState(0, (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 0.0, -1.0)
+
+
 def _foot_geom_ids(model, mujoco):
     out = []
     for body in FOOT_BODIES:
