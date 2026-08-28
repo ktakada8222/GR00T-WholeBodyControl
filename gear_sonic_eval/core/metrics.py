@@ -67,6 +67,9 @@ class EpisodeRecord:
     fall_phase: str = "none"
     #: Number of reset retries that preceded this (valid) episode.
     reset_retries: int = 0
+    #: The fall criteria were met during the warm-up. The episode still ran; the
+    #: flag says the robot started from a compromised state.
+    settle_unstable: bool = False
     duration: float = 0.0
     notes: str = ""
     #: "const" or "sine"; sine episodes additionally yield a tracking lag.
@@ -279,7 +282,8 @@ def compute_metrics(rec: EpisodeRecord, *, transient: float, dt: float, mass: fl
         "duration": rec.duration,
         "fell": bool(rec.fell and rec.fall_phase == "command"),
         "success": bool(not rec.fell),
-        "invalid": bool(rec.fall_phase == "settle"),
+        "invalid": bool(not rec.samples),
+        "settle_unstable": bool(rec.settle_unstable),
         "fall_phase": rec.fall_phase,
         "reset_retries": rec.reset_retries,
         "time_to_fall": rec.fall_time,
