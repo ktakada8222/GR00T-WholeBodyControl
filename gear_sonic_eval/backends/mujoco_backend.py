@@ -20,6 +20,12 @@ So the deploy binary must already be running against the same DDS domain/interfa
 never fabricates planner behaviour: it only sends the planner's own input format
 and measures the resulting robot state.
 
+The **elastic band is disabled** (``env.elastic_band = None``).  In the
+interactive workflow it is on by default and is released by pressing ``9`` in
+the MuJoCo window; a benchmark must not depend on a key press, and
+``DefaultEnv.sim_step`` zeroes ``xfrc_applied`` on the band body every step,
+which would silently cancel the push forces.
+
 Push disturbances use ``mj_data.xfrc_applied[pelvis]`` (a real MuJoCo API, held
 for ``duration`` seconds so the impulse is force*duration).  ``apply_perturbation``
 in ``base_sim.py`` was *not* reused because it adds an instantaneous velocity
@@ -74,6 +80,8 @@ class MujocoBackend(EvalBackend):
         self.zmq_host = backend_cfg.get("zmq_host", "*")
         self.rearm_wait = float(backend_cfg.get("rearm_wait", 3.0))
         self.startup_wait = float(backend_cfg.get("startup_wait", 2.0))
+        self.deploy_timeout = float(backend_cfg.get("deploy_timeout", 120.0))
+        self.use_elastic_band = bool(backend_cfg.get("elastic_band", False))
 
         sim_cfg = BaseConfig(
             wbc_version=backend_cfg.get("wbc_version", "sonic_model12"),
@@ -96,6 +104,11 @@ class MujocoBackend(EvalBackend):
         self._floor_geoms = _floor_geom_ids(self.model, mujoco)
         self._qpos0 = self.data.qpos.copy()
 
+        if not self.use_elastic_band:
+            # See the module docstring: the band both suspends the robot and
+            # clears xfrc_applied on the pelvis every physics step.
+            self.env.elastic_band = None
+
         ctx = zmq.Context.instance()
         self.socket = ctx.socket(zmq.PUB)
         self.socket.bind(f"tcp://{self.zmq_host}:{self.zmq_port}")
@@ -112,6 +125,7 @@ class MujocoBackend(EvalBackend):
         }
         self.t = 0.0
         self._push = np.zeros(3)
+        self._armed = False
 
     # ------------------------------------------------------------------ ZMQ
     def _send_command(self, start: bool, stop: bool, planner: bool = True) -> None:
@@ -133,9 +147,37 @@ class MujocoBackend(EvalBackend):
         )
 
     # --------------------------------------------------------------- episode
+    def wait_for_deploy(self, verbose: bool = True) -> bool:
+        """Step the sim until the deploy binary starts publishing LowCmd.
+
+        The deploy process needs LowState from this simulator to run its INIT
+        ramp, so the sim must already be stepping while we wait.  Detection uses
+        ``UnitreeSdk2Bridge.cmd_received()``.
+        """
+        if verbose:
+            print("waiting for g1_deploy_onnx_ref (LowCmd on rt/lowcmd) ...")
+        deadline = time.monotonic() + self.deploy_timeout
+        bridge = self.env.unitree_bridge
+        while time.monotonic() < deadline:
+            self._physics_step()
+            if bridge.cmd_received():
+                if verbose:
+                    print(f"  deploy detected; waiting {self.startup_wait:.1f}s for its INIT ramp")
+                end = time.monotonic() + self.startup_wait
+                while time.monotonic() < end:
+                    self._physics_step()
+                return True
+        print("  WARNING: no LowCmd received; is the deploy binary running with "
+              "--input-type zmq_manager on the same DDS interface?")
+        return False
+
     def reset(self, seed: int) -> None:
         rng = np.random.default_rng(seed)
         init = self.config.init
+
+        if not self._armed:
+            self.wait_for_deploy()
+            self._armed = True
 
         # Stop the controller, restore the initial state, re-arm in planner mode.
         self._send_command(start=False, stop=True)

@@ -29,5 +29,5 @@ conditions:
   - {name: walk_12, group: forward, vx: 1.2}
 
 backend:
-  mujoco: {zmq_port: 5556, interface: sim, rearm_wait: 3.0}
+  mujoco: {zmq_port: 5556, interface: sim, rearm_wait: 3.0, elastic_band: false}
   isaaclab: {mode: trajectory, task: Isaac-Velocity-Flat-G1-Play-v0}

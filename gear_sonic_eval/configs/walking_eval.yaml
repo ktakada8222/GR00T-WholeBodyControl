@@ -50,8 +50,10 @@ backend:
     zmq_port: 5556       # must match g1_deploy_onnx_ref --zmq-port
     wbc_version: sonic_model12
     interface: sim
-    startup_wait: 2.0
+    startup_wait: 2.0    # wait after LowCmd is first seen (deploy INIT ramp)
     rearm_wait: 3.0      # time given to the deploy binary to re-init the planner
+    deploy_timeout: 120.0  # how long to wait for the deploy binary at startup
+    elastic_band: false  # the "9" key band must stay off during evaluation
   isaaclab:
     mode: trajectory     # trajectory | velocity_policy
     task: Isaac-Velocity-Flat-G1-Play-v0

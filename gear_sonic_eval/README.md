@@ -82,23 +82,42 @@ Useful flags: `--num-episodes`, `--seed`, `--episode-duration`, `--conditions`,
 `--output-dir`, `--headless`, `--visualize`, `--real-time`, `--no-plots`,
 `--no-timeseries`, `--dry-run`.
 
-### MuJoCo prerequisite
+### MuJoCo: how the interactive workflow maps to the benchmark
 
-The backend owns the MuJoCo simulator (`gear_sonic.utils.mujoco_sim.DefaultEnv`,
-the same environment `scripts/run_sim_loop.py` uses) and publishes planner
-commands over ZMQ.  The controller is the deploy binary and must already be
-running on the same DDS domain:
+The manual workflow is 2 terminals + key presses:
+
+| manual step | benchmark equivalent |
+|---|---|
+| Terminal 1: `python gear_sonic/scripts/run_sim_loop.py` | **replaced** by `evaluate_sonic_planner.py --sim mujoco` (the benchmark *is* the simulator, so it can step deterministically, reset per episode and apply pushes) |
+| Terminal 2: `bash deploy.sh --input-type keyboard sim` | `bash deploy.sh --input-type zmq_manager sim` |
+| `]` (start policy) | `command{start=true, stop=false, planner=true}` on the ZMQ `command` topic |
+| `Enter` (planner mode) | same message — `ZMQManager::handlePlannerInput` enables the planner and waits for its init |
+| `9` in MuJoCo (release elastic band) | the band is disabled in code (`backend.mujoco.elastic_band: false`) |
+| W/A/S/D/Q/E (movement keys) | `planner` topic messages generated from the config's `(vx, vy, yaw_rate)` grid |
+
+Run exactly two terminals:
 
 ```bash
-./g1_deploy_onnx_ref lo policy/model.onnx reference/motions/ \
-    --planner-file policy/planner_V2.onnx \
-    --obs-config policy/observation_config.yaml \
-    --input-type zmq_manager --zmq-port 5556 --disable-crc-check
+# Terminal 1 (host) -- simulator + benchmark. Start this FIRST; it waits for the
+# deploy binary and keeps stepping so the deploy INIT ramp can run.
+cd ~/GR00T-WholeBodyControl && source .venv_sim/bin/activate
+python gear_sonic_eval/evaluate_sonic_planner.py --sim mujoco \
+    --config gear_sonic_eval/configs/walking_eval.yaml --visualize
+
+# Terminal 2 (docker) -- the Sonic planner + WBC policy
+cd ~/GR00T-WholeBodyControl/gear_sonic_deploy
+export TensorRT_ROOT="$HOME/TensorRT"
+./docker/run-ros2-dev-takada.sh
+bash deploy.sh --input-type zmq_manager sim
 ```
 
-Do **not** start `run_sim_loop.py` as well — the benchmark is the simulator
-process, so that it can step deterministically, reset per episode and apply
-pushes.
+Do **not** start `run_sim_loop.py` as well: two MuJoCo processes would both
+publish `rt/lowstate` on the same DDS domain and the controller would see
+interleaved states.  No key presses are needed in either terminal.
+
+The container runs with `--network host`, so the deploy binary's ZMQ subscriber
+(`--zmq-host localhost`, port 5556 by default) reaches the PUB socket the
+benchmark binds on the host.
 
 ## Metrics
 
