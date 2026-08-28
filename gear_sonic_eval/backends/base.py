@@ -54,6 +54,13 @@ class EvalBackend(abc.ABC):
     def base_yaw(self) -> float:
         """Current world yaw of the pelvis [rad] (used to orient pushes)."""
 
+    def prepare(self) -> None:
+        """One-off setup before the first episode (handshakes, warm-up).
+
+        The MuJoCo backend waits here for the deploy binary to come up, so the
+        wait is not printed in the middle of the first episode's log line.
+        """
+
     def begin_episode(self, condition, disturbance=None) -> None:
         """Optional hook called after ``reset`` with the episode descriptor.
 

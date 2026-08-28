@@ -54,6 +54,7 @@ backend:
     rearm_wait: 3.0      # time given to the deploy binary to re-init the planner
     deploy_timeout: 120.0  # how long to wait for the deploy binary at startup
     elastic_band: false  # the "9" key band must stay off during evaluation
+    real_time: true      # the deploy binary is a wall-clock 50 Hz process
   isaaclab:
     mode: trajectory     # trajectory | velocity_policy
     task: Isaac-Velocity-Flat-G1-Play-v0

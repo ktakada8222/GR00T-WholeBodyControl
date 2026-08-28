@@ -139,6 +139,7 @@ def run_evaluation(
     verbose: bool = True,
 ) -> ResultWriter:
     """Run every episode of the manifest and write the full result tree."""
+    backend.prepare()
     writer = ResultWriter(output_dir, backend.name, config=config, run_info=backend.info)
     episodes = config.episodes()
     for n, ep in enumerate(episodes, start=1):

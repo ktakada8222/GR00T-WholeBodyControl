@@ -82,6 +82,11 @@ class MujocoBackend(EvalBackend):
         self.startup_wait = float(backend_cfg.get("startup_wait", 2.0))
         self.deploy_timeout = float(backend_cfg.get("deploy_timeout", 120.0))
         self.use_elastic_band = bool(backend_cfg.get("elastic_band", False))
+        # The controller is an external real-time process (its Control thread
+        # runs at wall-clock 50 Hz), so the simulator must advance at wall-clock
+        # speed too -- exactly what BaseSimulator.start does. Free-running would
+        # give the robot many physics steps per controller command.
+        self.pace_real_time = bool(backend_cfg.get("real_time", True))
 
         sim_cfg = BaseConfig(
             wbc_version=backend_cfg.get("wbc_version", "sonic_model12"),
@@ -96,6 +101,20 @@ class MujocoBackend(EvalBackend):
 
         self.wrapper = _EvalEnv(self.wbc_config, onscreen=onscreen)
         self.env = self.wrapper.env
+
+        # DefaultEnv does not create the DDS bridge itself -- BaseSimulator does
+        # and injects it (init_unitree_bridge + set_unitree_bridge in base_sim.py).
+        # We own the loop instead of BaseSimulator, so we must do the same here,
+        # after ChannelFactoryInitialize and before the first sim_step.
+        from gear_sonic.utils.mujoco_sim.unitree_sdk2py_bridge import UnitreeSdk2Bridge
+
+        self.bridge = UnitreeSdk2Bridge(self.wbc_config)
+        if self.wbc_config.get("USE_JOYSTICK"):
+            self.bridge.SetupJoystick(
+                device_id=self.wbc_config["JOYSTICK_DEVICE"],
+                js_type=self.wbc_config["JOYSTICK_TYPE"],
+            )
+        self.env.set_unitree_bridge(self.bridge)
         self.model, self.data = self.env.mj_model, self.env.mj_data
         self.pelvis_id = self.model.body("pelvis").id
         self.substeps = max(int(round(config.sim.control_dt / config.sim.physics_dt)), 1)
@@ -126,6 +145,10 @@ class MujocoBackend(EvalBackend):
         self.t = 0.0
         self._push = np.zeros(3)
         self._armed = False
+        self.sim_dt = float(self.model.opt.timestep)
+        self._next_step_wall = None
+        # pacing is done here, per physics step; the runner must not sleep again
+        config.sim.real_time = False
 
     # ------------------------------------------------------------------ ZMQ
     def _send_command(self, start: bool, stop: bool, planner: bool = True) -> None:
@@ -171,13 +194,14 @@ class MujocoBackend(EvalBackend):
               "--input-type zmq_manager on the same DDS interface?")
         return False
 
-    def reset(self, seed: int) -> None:
-        rng = np.random.default_rng(seed)
-        init = self.config.init
-
+    def prepare(self) -> None:
         if not self._armed:
             self.wait_for_deploy()
             self._armed = True
+
+    def reset(self, seed: int) -> None:
+        rng = np.random.default_rng(seed)
+        init = self.config.init
 
         # Stop the controller, restore the initial state, re-arm in planner mode.
         self._send_command(start=False, stop=True)
@@ -209,6 +233,16 @@ class MujocoBackend(EvalBackend):
     def _physics_step(self) -> None:
         self.data.xfrc_applied[self.pelvis_id, :3] = self._push
         self.env.sim_step()
+        if self.pace_real_time:
+            now = time.monotonic()
+            if self._next_step_wall is None:
+                self._next_step_wall = now
+            self._next_step_wall += self.sim_dt
+            delay = self._next_step_wall - now
+            if delay > 0:
+                time.sleep(delay)
+            elif delay < -0.5:  # fell far behind (e.g. a viewer stall): resync
+                self._next_step_wall = now
 
     def step(self) -> StepSample:
         for _ in range(self.substeps):
@@ -259,12 +293,19 @@ class MujocoBackend(EvalBackend):
         )
 
     def close(self) -> None:
-        try:
-            self._send_command(start=False, stop=True)
-            self.socket.close(linger=200)
-        finally:
-            if getattr(self.env, "viewer", None) is not None:
-                self.env.viewer.close()
+        socket = getattr(self, "socket", None)
+        if socket is not None:
+            try:
+                self._send_command(start=False, stop=True)
+            except Exception as exc:  # noqa: BLE001 - teardown must not mask errors
+                print(f"[mujoco backend] could not send stop command: {exc}")
+            socket.close(linger=200)
+            self.socket = None
+        env = getattr(self, "env", None)
+        viewer = getattr(env, "viewer", None) if env is not None else None
+        if viewer is not None:
+            viewer.close()
+            self.env.viewer = None
 
 
 # ------------------------------------------------------------------- helpers
