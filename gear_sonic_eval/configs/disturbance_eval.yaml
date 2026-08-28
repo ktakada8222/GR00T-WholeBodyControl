@@ -1,0 +1,33 @@
+# Push-rejection sweep: fewer cruise speeds, the full force x direction grid.
+name: sonic_disturbance_eval
+seed: 0
+num_episodes: 5
+
+sim:
+  control_dt: 0.02
+  physics_dt: 0.005
+  command_dt: 0.1
+  episode_duration: 10.0
+  settle_duration: 3.0
+  transient_duration: 1.5
+
+init: {base_height: 0.793, base_yaw: 0.0, joint_noise: 0.0}
+fall: {min_base_height: 0.4, max_tilt_deg: 50.0, hold_steps: 5}
+
+disturbance:
+  enabled: true
+  forces: [50.0, 100.0, 150.0, 200.0, 250.0]
+  directions: [front, back, left, right, random]
+  duration: 0.1
+  time: 4.0
+  conditions: []        # empty = every condition below
+
+conditions:
+  - {name: stand,   group: forward, vx: 0.0}
+  - {name: walk_04, group: forward, vx: 0.4}
+  - {name: walk_08, group: forward, vx: 0.8}
+  - {name: walk_12, group: forward, vx: 1.2}
+
+backend:
+  mujoco: {zmq_port: 5556, interface: sim, rearm_wait: 3.0}
+  isaaclab: {mode: trajectory, task: Isaac-Velocity-Flat-G1-Play-v0}

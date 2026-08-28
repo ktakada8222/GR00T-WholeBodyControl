@@ -1,0 +1,59 @@
+# Default evaluation configuration for evaluate_sonic_planner.py.
+# Shared verbatim between the MuJoCo and IsaacLab runners for sim-to-sim comparison.
+
+seeds: [0, 1, 2]
+
+sim_params:
+  sim_timestep: 0.005        # physics dt (200 Hz), matches gear_sonic SIMULATE_DT
+  control_frequency: 50.0    # planner trajectory rate
+  episode_duration_s: 10.0
+  settle_time_s: 1.0
+  initial_pose: default_standing
+
+planner_backend: mock        # "onnx" | "zmq" | "mock" -- see common/planner_client.py
+planner_model_path: null     # path to the Sonic planner .onnx, required for "onnx" backend
+
+output_dir: results
+
+velocity_conditions:
+  # forward
+  - {name: fwd_0.2, vx: 0.2, vy: 0.0, yaw_rate: 0.0}
+  - {name: fwd_0.4, vx: 0.4, vy: 0.0, yaw_rate: 0.0}
+  - {name: fwd_0.6, vx: 0.6, vy: 0.0, yaw_rate: 0.0}
+  - {name: fwd_0.8, vx: 0.8, vy: 0.0, yaw_rate: 0.0}
+  - {name: fwd_1.0, vx: 1.0, vy: 0.0, yaw_rate: 0.0}
+  - {name: fwd_1.2, vx: 1.2, vy: 0.0, yaw_rate: 0.0}
+  - {name: fwd_1.5, vx: 1.5, vy: 0.0, yaw_rate: 0.0}
+  - {name: fwd_2.0, vx: 2.0, vy: 0.0, yaw_rate: 0.0}
+  # backward
+  - {name: bwd_0.2, vx: -0.2, vy: 0.0, yaw_rate: 0.0}
+  - {name: bwd_0.4, vx: -0.4, vy: 0.0, yaw_rate: 0.0}
+  - {name: bwd_0.6, vx: -0.6, vy: 0.0, yaw_rate: 0.0}
+  - {name: bwd_0.8, vx: -0.8, vy: 0.0, yaw_rate: 0.0}
+  # lateral
+  - {name: lat_+0.2, vx: 0.0, vy: 0.2, yaw_rate: 0.0}
+  - {name: lat_-0.2, vx: 0.0, vy: -0.2, yaw_rate: 0.0}
+  - {name: lat_+0.4, vx: 0.0, vy: 0.4, yaw_rate: 0.0}
+  - {name: lat_-0.4, vx: 0.0, vy: -0.4, yaw_rate: 0.0}
+  - {name: lat_+0.6, vx: 0.0, vy: 0.6, yaw_rate: 0.0}
+  - {name: lat_-0.6, vx: 0.0, vy: -0.6, yaw_rate: 0.0}
+  # turning in place
+  - {name: yaw_+0.2, vx: 0.0, vy: 0.0, yaw_rate: 0.2}
+  - {name: yaw_-0.2, vx: 0.0, vy: 0.0, yaw_rate: -0.2}
+  - {name: yaw_+0.5, vx: 0.0, vy: 0.0, yaw_rate: 0.5}
+  - {name: yaw_-0.5, vx: 0.0, vy: 0.0, yaw_rate: -0.5}
+  - {name: yaw_+1.0, vx: 0.0, vy: 0.0, yaw_rate: 1.0}
+  - {name: yaw_-1.0, vx: 0.0, vy: 0.0, yaw_rate: -1.0}
+  # compound
+  - {name: compound_1, vx: 0.5, vy: 0.3, yaw_rate: 0.3}
+  - {name: compound_2, vx: 0.8, vy: -0.2, yaw_rate: -0.4}
+
+disturbance_conditions:
+  - {name: push_y_50N, axis: "y", force_n: 50, duration_s: 0.2, apply_at_s: 3.0}
+  - {name: push_y_100N, axis: "y", force_n: 100, duration_s: 0.2, apply_at_s: 3.0}
+  - {name: push_y_150N, axis: "y", force_n: 150, duration_s: 0.2, apply_at_s: 3.0}
+  - {name: push_y_200N, axis: "y", force_n: 200, duration_s: 0.2, apply_at_s: 3.0}
+  - {name: push_y_250N, axis: "y", force_n: 250, duration_s: 0.2, apply_at_s: 3.0}
+  - {name: push_x_100N, axis: "x", force_n: 100, duration_s: 0.2, apply_at_s: 3.0}
+  - {name: push_x_200N, axis: "x", force_n: 200, duration_s: 0.2, apply_at_s: 3.0}
+  - {name: push_random_150N, axis: "random", force_n: 150, duration_s: 0.2, apply_at_s: 3.0}

@@ -1,0 +1,31 @@
+# Tiny configuration used to smoke-test the framework (works with --sim mock).
+name: sonic_smoke_eval
+seed: 0
+num_episodes: 2
+
+sim:
+  control_dt: 0.02
+  physics_dt: 0.005
+  command_dt: 0.1
+  episode_duration: 6.0
+  settle_duration: 0.5
+  transient_duration: 1.0
+
+init: {base_height: 0.793, joint_noise: 0.0}
+fall: {min_base_height: 0.4, max_tilt_deg: 50.0, hold_steps: 5}
+
+disturbance:
+  enabled: false
+  forces: [100.0, 200.0]
+  directions: [front, left]
+  duration: 0.1
+  time: 3.0
+  conditions: []
+
+conditions:
+  - {group: forward,  sweep: vx,       values: [0.4, 0.8, 1.2]}
+  - {group: lateral,  sweep: vy,       values: [-0.4, 0.4]}
+  - {group: turn,     sweep: yaw_rate, values: [0.5]}
+  - {name: compound_a, group: compound, vx: 0.5, vy: 0.3, yaw_rate: 0.3}
+
+backend: {}
