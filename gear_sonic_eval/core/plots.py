@@ -286,3 +286,14 @@ def plot_comparison(roots: dict[str, str | Path], out_dir: str | Path) -> list[P
         fig.suptitle(f"Sim-to-sim comparison ({axis})")
         made.append(_save(fig, out_dir / f"09_sim2sim_{axis}.png"))
     return made
+
+
+if __name__ == "__main__":
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="Regenerate the benchmark plots from an existing result directory, "
+        "e.g. python -m gear_sonic_eval.core.plots results/mujoco"
+    )
+    ap.add_argument("result_dir", help="results/<backend> directory containing summary.csv")
+    plot_all(ap.parse_args().result_dir)

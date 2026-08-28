@@ -111,12 +111,25 @@ def main(argv=None) -> int:
         backend.close()
 
     if not args.no_plots:
-        from gear_sonic_eval.core.plots import plot_all
-
-        print("\ngenerating plots:")
-        plot_all(writer.root)
+        try:
+            from gear_sonic_eval.core.plots import plot_all
+        except ImportError as exc:
+            print(f"\nskipping plots: {exc}")
+            print("  the CSV results above are complete; install matplotlib and run")
+            print(f"  python -m gear_sonic_eval.core.plots {writer.root}")
+        else:
+            print("\ngenerating plots:")
+            plot_all(writer.root)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    status = main()
+    # The DDS subscriber threads and the MuJoCo passive viewer crash during
+    # interpreter teardown (segfault after a completed run). Everything we own
+    # is already closed and flushed at this point, so leave immediately instead.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    import os
+
+    os._exit(status)

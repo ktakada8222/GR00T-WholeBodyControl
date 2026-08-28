@@ -78,6 +78,13 @@ python evaluate_sonic_planner.py --sim isaaclab --config configs/walking_eval.ya
 python compare_sims.py --results results --backends mujoco isaaclab
 ```
 
+Plots need matplotlib.  If it is missing the run still completes and writes every
+CSV; regenerate the figures afterwards with
+
+```bash
+python -m gear_sonic_eval.core.plots results/mujoco
+```
+
 Useful flags: `--num-episodes`, `--seed`, `--episode-duration`, `--conditions`,
 `--output-dir`, `--headless`, `--visualize`, `--real-time`, `--no-plots`,
 `--no-timeseries`, `--dry-run`.
